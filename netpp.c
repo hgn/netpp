@@ -353,6 +353,8 @@ int init_passive_socket(const char *addr, const char *port, int use_ipv6)
 	struct addrinfo hosthints, *hostres, *addrtmp;
 	struct ip_mreq mreq;
 	struct ipv6_mreq mreq6;
+	char addr_name[NI_MAXHOST];
+
 
 	memset(&hosthints, 0, sizeof(struct addrinfo));
 
@@ -366,11 +368,22 @@ int init_passive_socket(const char *addr, const char *port, int use_ipv6)
 
 	for (addrtmp = hostres; addrtmp != NULL ; addrtmp = addrtmp->ai_next) {
 
+		ret = getnameinfo(addrtmp->ai_addr, addrtmp->ai_addrlen,
+						addr_name, sizeof(addr_name), NULL, 0,
+						NI_NUMERICHOST | NI_NUMERICSERV);
+		if (ret) {
+			err_msg("failure for getnameinfo: %d ", ret);
+		}
+
+		pr_debug("try socket with %s", addr_name);
+
 		fd = socket_bind(addrtmp, addr);
 		if (fd < 0) {
-			pr_debug("Cannot create a socket");
+			pr_debug("failed create a socket");
 			continue;
 		}
+
+		pr_debug("succeeded");
 
 		break;
 	}
