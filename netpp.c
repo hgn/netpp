@@ -429,16 +429,43 @@ int init_passive_socket(const char *addr, const char *port, int use_ipv6)
 
 }
 
-
-int main(void)
+int server_mode(const char *filename)
 {
-	int pfd, afd;
+	int pfd;
+
+	printf("netpp [server mode, serving file %s]\n", filename);
 
 	pfd = init_passive_socket(LISTENADDRESS, PORT, 1);
 
 	sleep(10);
 
 	return EXIT_SUCCESS;
+}
+
+int client_mode(void)
+{
+	printf("netpp [client mode]\n");
+
+	return EXIT_SUCCESS;
+}
+
+
+int main(int ac, char **av)
+{
+
+	switch (ac) {
+		case 1:
+			return client_mode();
+			break;
+		case 2:
+			return server_mode(strdup(av[1]));
+			break;
+		default:
+			err_msg_die(EXIT_FAILOPT,
+					"netpp takes no or exactly one argument (the file) - exiting");
+			break;
+	}
+
 }
 
 /* vim: set tw=78 ts=4 sw=4 sts=4 ff=unix noet: */
