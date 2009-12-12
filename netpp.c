@@ -286,7 +286,7 @@ static void enable_multicast_v4(int fd, const char *hostname)
 
 	ret = inet_pton(AF_INET, hostname, &mreq.imr_multiaddr);
 	if (ret < 1) {
-		err_sys_die("Cannot convert address (%s) into numeric representation",
+		err_sys_die(EXIT_FAILMISC, "Cannot convert address (%s) into numeric representation",
 				hostname);
 	}
 
@@ -309,7 +309,7 @@ static void enable_multicast_v6(int fd, const char *hostname)
 	mreq6.ipv6mr_interface = 0; /* FIXME: determine interface */
 	ret = inet_pton(AF_INET6, hostname, &mreq6.ipv6mr_multiaddr);
 	if (ret < 1) {
-		err_sys_die("Cannot convert address (%s) into numeric representation",
+		err_sys_die(EXIT_FAILMISC, "Cannot convert address (%s) into numeric representation",
 				hostname);
 	}
 
