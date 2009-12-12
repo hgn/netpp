@@ -285,6 +285,10 @@ static void enable_multicast_v4(int fd, const char *hostname)
 	memset(&mreq, 0, sizeof(struct ip_mreq));
 
 	ret = inet_pton(AF_INET, hostname, &mreq.imr_multiaddr);
+	if (ret < 1) {
+		err_sys_die("Cannot convert address (%s) into numeric representation",
+				hostname);
+	}
 
 	mreq.imr_interface.s_addr = INADDR_ANY;
 
@@ -302,8 +306,12 @@ static void enable_multicast_v6(int fd, const char *hostname)
 
 	memset(&mreq6, 0, sizeof(struct ipv6_mreq));
 
-	mreq6.ipv6mr_interface = 0; /* FIXME: interface missing */
+	mreq6.ipv6mr_interface = 0; /* FIXME: determine interface */
 	ret = inet_pton(AF_INET6, hostname, &mreq6.ipv6mr_multiaddr);
+	if (ret < 1) {
+		err_sys_die("Cannot convert address (%s) into numeric representation",
+				hostname);
+	}
 
 	xsetsockopt(fd, IPPROTO_IPV6, IPV6_MULTICAST_LOOP,
 			&on, sizeof(int), "IPV6_MULTICAST_LOOP");
