@@ -126,8 +126,6 @@
 #define SUCCESS 0
 #define FAILURE -1
 
-#define DEFAULT_LISTEN_PORT "6666"
-
 #define RANDPOOLSRC "/dev/urandom"
 
 #define MAXERRMSG 1024
@@ -135,6 +133,7 @@
 struct opts {
 	int wanted_af_family;
 	char *me;
+	char *port;
 	char *filename;
 };
 
@@ -284,7 +283,7 @@ static void xgetaddrinfo(const char *node, const char *service,
 }
 
 #define	LISTENADDRESS "224.110.99.112"
-#define PORT "6666"
+#define DEFAULT_LISTEN_PORT "6666"
 
 static void usage(const char *me)
 {
@@ -697,13 +696,14 @@ int server_mode(const struct opts *opts)
 	struct client_request_info *client_request_info;
 	struct file_hndl *file_hndl;
 	int must_block = 0;
+	const char *port = opts->port ?: DEFAULT_LISTEN_PORT;
 
 	pr_debug("netpp [server mode, serving file %s]", opts->filename);
 
 	file_hndl = init_file_hndl(opts->filename);
 
-	pfd = init_passive_socket(LISTENADDRESS, PORT, must_block);
-	afd = init_active_socket(LISTENADDRESS, PORT);
+	pfd = init_passive_socket(LISTENADDRESS, port, must_block);
+	afd = init_active_socket(LISTENADDRESS, port);
 
 
 	while (23) {
@@ -777,12 +777,13 @@ int client_mode(const struct opts *opts)
 	int pfd, ret;
 	struct srv_announcement_info *sai;
 	int must_block = 1;
+	const char *port = opts->port ?: DEFAULT_LISTEN_PORT;
 
 	(void) opts;
 
 	pr_debug("netpp [client mode]");
 
-	pfd = init_passive_socket(LISTENADDRESS, PORT, must_block);
+	pfd = init_passive_socket(LISTENADDRESS, port, must_block);
 
 	while (23) {
 		ret = client_try_read_announcement_pdu(pfd, &sai);
@@ -853,10 +854,11 @@ int main(int ac, char **av)
 			{"help",            0, 0, 'h'},
 			{"ipv4",            0, 0, '4'},
 			{"ipv6",            0, 0, '6'},
+			{"port",            0, 0, 'p'},
 			{0, 0, 0, 0}
 		};
 
-		c = getopt_long(ac, av, "h46",
+		c = getopt_long(ac, av, "p:h46",
 						long_options, &option_index);
 		if (c == -1)
 			break;
@@ -867,6 +869,9 @@ int main(int ac, char **av)
 				break;
 			case '6':
 				opts->wanted_af_family = PF_INET6;
+				break;
+			case 'p':
+				opts->port = xstrdup(optarg);
 				break;
 			case 'h':
 				usage(opts->me);
@@ -897,6 +902,8 @@ int main(int ac, char **av)
 out_server:
 	free(opts->filename);
 out_client:
+	if (opts->port)
+		free(opts->port);
 	free(opts->me);
 	free(opts);
 	return error;
