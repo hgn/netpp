@@ -29,6 +29,7 @@
 #include <sys/types.h>
 #include <assert.h>
 #include <inttypes.h>
+#include <getopt.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -130,6 +131,12 @@
 #define RANDPOOLSRC "/dev/urandom"
 
 #define MAXERRMSG 1024
+
+struct opts {
+	int wanted_af_family;
+	char *me;
+	char *filename;
+};
 
 int subtime(struct timeval *op1, struct timeval *op2,
 				   struct timeval *result)
@@ -278,6 +285,12 @@ static void xgetaddrinfo(const char *node, const char *service,
 
 #define	LISTENADDRESS "224.110.99.112"
 #define PORT "6666"
+
+static void usage(const char *me)
+{
+	fprintf(stdout, "%s (-4|-6) [filename]\n",
+			me);
+}
 
 static void enable_multicast_v4(int fd, const struct addrinfo *a)
 {
@@ -678,19 +691,16 @@ static void srv_tx_file(const struct client_request_info *cri, const char *file)
  * If a client want to receive this data the client opens
  * a TCP socket and inform the server that he want this file,
  * we push this file to the server */
-int server_mode(char *filename)
+int server_mode(const struct opts *opts)
 {
 	int pfd, afd, ret;
 	struct client_request_info *client_request_info;
 	struct file_hndl *file_hndl;
 	int must_block = 0;
 
-	if (!filename)
-		err_sys_die(EXIT_FAILOPT, "Failed to strdup()");
+	pr_debug("netpp [server mode, serving file %s]", opts->filename);
 
-	pr_debug("netpp [server mode, serving file %s]", filename);
-
-	file_hndl = init_file_hndl(filename);
+	file_hndl = init_file_hndl(opts->filename);
 
 	pfd = init_passive_socket(LISTENADDRESS, PORT, must_block);
 	afd = init_active_socket(LISTENADDRESS, PORT);
@@ -708,7 +718,7 @@ int server_mode(char *filename)
 			if (ret != SUCCESS)
 				break;
 
-			srv_tx_file(client_request_info, filename);
+			srv_tx_file(client_request_info, opts->filename);
 
 			free_client_request_info(client_request_info);
 		}
@@ -717,7 +727,6 @@ int server_mode(char *filename)
 	}
 
 	free_file_hndl(file_hndl);
-	free(filename);
 	close(pfd);
 
 	return EXIT_SUCCESS;
@@ -763,11 +772,13 @@ static int client_try_read_announcement_pdu(int pfd, struct srv_announcement_inf
  * wait for server file announcements. If the server
  * announce a file the client opens a random TCP port,
  * send this port to the server and waits for the data */
-int client_mode(void)
+int client_mode(const struct opts *opts)
 {
 	int pfd, ret;
 	struct srv_announcement_info *sai;
 	int must_block = 1;
+
+	(void) opts;
 
 	pr_debug("netpp [client mode]");
 
@@ -816,36 +827,79 @@ int client_mode(void)
 
 #endif
 
-	sleep(100);
-
 	close(pfd);
 
 	return EXIT_SUCCESS;
 }
 
-
 int main(int ac, char **av)
 {
-	int ret;
+	int c, ret, error;
+	struct opts *opts;
 
 	ret = initiate_seed();
 	if (ret != SUCCESS)
 		err_msg_die(EXIT_FAILMISC, "Cannot initialize random seed");
 
-	switch (ac) {
-		case 1:
-			return client_mode();
+	opts = xzalloc(sizeof(*opts));
+
+	/* opts defaults */
+	opts->wanted_af_family = PF_UNSPEC;
+	opts->me = xstrdup(av[0]);
+
+	while (1) {
+		int option_index = 0;
+		static struct option long_options[] = {
+			{"help",            0, 0, 'h'},
+			{"ipv4",            0, 0, '4'},
+			{"ipv6",            0, 0, '6'},
+			{0, 0, 0, 0}
+		};
+
+		c = getopt_long(ac, av, "h46",
+						long_options, &option_index);
+		if (c == -1)
 			break;
-		case 2:
-			return server_mode(strdup(av[1]));
-			break;
-		default:
-			err_msg_die(EXIT_FAILOPT,
-					"netpp takes no or exactly one argument (the file) - exiting");
-			break;
+
+		switch (c) {
+			case '4':
+				opts->wanted_af_family = PF_INET;
+				break;
+			case '6':
+				opts->wanted_af_family = PF_INET6;
+				break;
+			case 'h':
+				usage(opts->me);
+				error = EXIT_SUCCESS;
+				goto out_client;
+				break;
+			case '?':
+				error = EXIT_FAILOPT;
+				goto out_client;
+				break;
+			default:
+				fprintf(stderr, "?? getopt returned character code 0%o ??\n", c);
+				break;
+		}
 	}
 
-	return FAILURE; /* should not happened */
+	if (optind >= ac) {
+		/* FIXME: handle the case where more files are given */
+		error = client_mode(opts);
+		goto out_client;
+	}
+
+	opts->filename = xstrdup(av[optind]);
+
+	error = server_mode(opts);
+	goto out_server;
+
+out_server:
+	free(opts->filename);
+out_client:
+	free(opts->me);
+	free(opts);
+	return error;
 }
 
 /* vim: set tw=78 ts=4 sw=4 sts=4 ff=unix noet cino=(0: */
