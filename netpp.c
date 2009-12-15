@@ -110,6 +110,9 @@
                         msg(format, ##args); \
 		} while (0)
 
+/* determine the size of an array */
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+
 #define EXIT_OK         EXIT_SUCCESS
 #define EXIT_FAILMEM    1
 #define EXIT_FAILOPT    2
@@ -120,15 +123,15 @@
 #define EXIT_FAILFILE   8
 #define EXIT_FAILINT    9 /* INTernal error */
 
-/* determine the size of an array */
-#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
-
 #define SUCCESS 0
 #define FAILURE -1
 
 #define RANDPOOLSRC "/dev/urandom"
 
 #define MAXERRMSG 1024
+
+#define	LISTENADDRESS "224.110.99.112"
+#define DEFAULT_LISTEN_PORT "6666"
 
 struct opts {
 	int wanted_af_family;
@@ -281,9 +284,6 @@ static void xgetaddrinfo(const char *node, const char *service,
 
 	return;
 }
-
-#define	LISTENADDRESS "224.110.99.112"
-#define DEFAULT_LISTEN_PORT "6666"
 
 static void usage(const char *me)
 {
