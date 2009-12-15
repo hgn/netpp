@@ -28,6 +28,7 @@
 #include <sys/resource.h>
 #include <sys/types.h>
 #include <assert.h>
+#include <inttypes.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -115,7 +116,8 @@
 #define EXIT_FAILNET    4
 #define EXIT_FAILHEADER 6
 #define EXIT_FAILEVENT  7
-#define EXIT_FAILINT    8 /* INTernal error */
+#define EXIT_FAILFILE   8
+#define EXIT_FAILINT    9 /* INTernal error */
 
 /* determine the size of an array */
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
@@ -129,167 +131,161 @@
 
 #define MAXERRMSG 1024
 
-static int subtime(struct timeval *op1, struct timeval *op2,
-	struct timeval *result)
+int subtime(struct timeval *op1, struct timeval *op2,
+				   struct timeval *result)
 {
-        int borrow = 0, sign = 0;
-        struct timeval *temp_time;
+	int borrow = 0, sign = 0;
+	struct timeval *temp_time;
 
-        if (TIME_LT(op1, op2)) {
-                temp_time = op1;
-                op1  = op2;
-                op2  = temp_time;
-                sign = 1;
-        }
+	if (TIME_LT(op1, op2)) {
+		temp_time = op1;
+		op1  = op2;
+		op2  = temp_time;
+		sign = 1;
+	}
 
-        if (op1->tv_usec >= op2->tv_usec) {
-                result->tv_usec = op1->tv_usec-op2->tv_usec;
-        } else {
-                result->tv_usec = (op1->tv_usec + 1000000) - op2->tv_usec;
-                borrow = 1;
-        }
-        result->tv_sec = (op1->tv_sec-op2->tv_sec) - borrow;
+	if (op1->tv_usec >= op2->tv_usec) {
+		result->tv_usec = op1->tv_usec-op2->tv_usec;
+	} else {
+		result->tv_usec = (op1->tv_usec + 1000000) - op2->tv_usec;
+		borrow = 1;
+	}
+	result->tv_sec = (op1->tv_sec-op2->tv_sec) - borrow;
 
-        return sign;
+	return sign;
 }
 
 void msg(const char *format, ...)
 {
-        va_list ap;
-        struct timeval tv;
+	va_list ap;
+	struct timeval tv;
 
-        gettimeofday(&tv, NULL);
-        fprintf(stderr, "[%ld.%06ld] ", tv.tv_sec, tv.tv_usec);
+	gettimeofday(&tv, NULL);
+	fprintf(stderr, "[%ld.%06ld] ", tv.tv_sec, tv.tv_usec);
 
-         va_start(ap, format);
-         vfprintf(stderr, format, ap);
-         va_end(ap);
+	va_start(ap, format);
+	vfprintf(stderr, format, ap);
+	va_end(ap);
 
-         fputs("\n", stderr);
+	fputs("\n", stderr);
 }
 
 
 static void err_doit(int sys_error, const char *file,
-                const int line_no, const char *fmt, va_list ap)
+					 const int line_no, const char *fmt, va_list ap)
 {
-        int     errno_save;
-        char buf[MAXERRMSG];
+	int     errno_save;
+	char buf[MAXERRMSG];
 
-        errno_save = errno;
+	errno_save = errno;
 
-        vsnprintf(buf, sizeof(buf) - 1, fmt, ap);
-        if (sys_error) {
-                size_t len = strlen(buf);
-                snprintf(buf + len,  sizeof buf - len, " (%s)", strerror(errno_save));
-        }
+	vsnprintf(buf, sizeof(buf) - 1, fmt, ap);
+	if (sys_error) {
+		size_t len = strlen(buf);
+		snprintf(buf + len,  sizeof buf - len, " (%s)", strerror(errno_save));
+	}
 
-        fprintf(stderr, "ERROR [%s:%d]: %s\n", file, line_no, buf);
-        fflush(NULL);
+	fprintf(stderr, "ERROR [%s:%d]: %s\n", file, line_no, buf);
+	fflush(NULL);
 
-        errno = errno_save;
+	errno = errno_save;
 }
 
 void x_err_ret(const char *file, int line_no, const char *fmt, ...)
 {
-        va_list ap;
+	va_list ap;
 
-        va_start(ap, fmt);
-        err_doit(0, file, line_no, fmt, ap);
-        va_end(ap);
-        return;
+	va_start(ap, fmt);
+	err_doit(0, file, line_no, fmt, ap);
+	va_end(ap);
+	return;
 }
 
 
 void x_err_sys(const char *file, int line_no, const char *fmt, ...)
 {
-        va_list         ap;
+	va_list         ap;
 
-        va_start(ap, fmt);
-        err_doit(1, file, line_no, fmt, ap);
-        va_end(ap);
+	va_start(ap, fmt);
+	err_doit(1, file, line_no, fmt, ap);
+	va_end(ap);
 }
 
 
 static void * xmalloc(size_t size)
 {
-        void *ptr = malloc(size);
-        if (!ptr)
-                err_msg_die(EXIT_FAILMEM, "Out of mem: %s!\n", strerror(errno));
-        return ptr;
+	void *ptr = malloc(size);
+	if (!ptr)
+		err_msg_die(EXIT_FAILMEM, "Out of mem: %s!\n", strerror(errno));
+	return ptr;
 }
 
 static void* xzalloc(size_t size)
 {
-        void *ptr = xmalloc(size);
-        memset(ptr, 0, size);
-        return ptr;
+	void *ptr = xmalloc(size);
+	memset(ptr, 0, size);
+	return ptr;
 }
 
 static void xsetsockopt(int s, int level, int optname,
-                const void *optval, socklen_t optlen, const char *str)
+						const void *optval, socklen_t optlen, const char *str)
 {
-        int ret = setsockopt(s, level, optname, optval, optlen);
-        if (ret)
-                err_sys_die(EXIT_FAILNET, "Can't set socketoption %s", str);
+	int ret = setsockopt(s, level, optname, optval, optlen);
+	if (ret)
+		err_sys_die(EXIT_FAILNET, "Can't set socketoption %s", str);
 }
 
 static int initiate_seed(void)
 {
-        ssize_t ret;
-        int rand_fd;
-        unsigned int randpool;
+	ssize_t ret;
+	int rand_fd;
+	unsigned int randpool;
 
-        /* set randon pool seed */
-        rand_fd = open(RANDPOOLSRC, O_RDONLY);
-        if (rand_fd < 0)
-                err_sys_die(EXIT_FAILINT,
-                                "Cannot open random pool file %s", RANDPOOLSRC);
+	/* set randon pool seed */
+	rand_fd = open(RANDPOOLSRC, O_RDONLY);
+	if (rand_fd < 0)
+		err_sys_die(EXIT_FAILINT,
+					"Cannot open random pool file %s", RANDPOOLSRC);
 
-        ret = read(rand_fd, &randpool, sizeof(unsigned int));
-        if (ret != sizeof(unsigned int)) {
-                srandom(time(NULL) & getpid());
-                close(rand_fd);
-                return FAILURE;
-        }
+	ret = read(rand_fd, &randpool, sizeof(unsigned int));
+	if (ret != sizeof(unsigned int)) {
+		srandom(time(NULL) & getpid());
+		close(rand_fd);
+		return FAILURE;
+	}
 
-        /* set global seed */
-        srandom(randpool);
+	/* set global seed */
+	srandom(randpool);
 
-        close(rand_fd);
+	close(rand_fd);
 
-        return SUCCESS;
+	return SUCCESS;
 }
 
 static void xgetaddrinfo(const char *node, const char *service,
-                struct addrinfo *hints, struct addrinfo **res)
+						 struct addrinfo *hints, struct addrinfo **res)
 {
-        int ret;
+	int ret;
 
-        ret = getaddrinfo(node, service, hints, res);
-        if (ret != 0) {
-                err_msg_die(EXIT_FAILNET, "Call to getaddrinfo() failed: %s!\n",
-                                (ret == EAI_SYSTEM) ?  strerror(errno) : gai_strerror(ret));
-        }
+	ret = getaddrinfo(node, service, hints, res);
+	if (unlikely(ret != 0)) {
+		err_msg_die(EXIT_FAILNET, "Call to getaddrinfo() failed: %s!\n",
+					(ret == EAI_SYSTEM) ?  strerror(errno) : gai_strerror(ret));
+	}
 
-        return;
+	return;
 }
 
 #define	LISTENADDRESS "224.110.99.112"
 #define PORT "6666"
 
-static void enable_multicast_v4(int fd, const char *hostname)
+static void enable_multicast_v4(int fd, const struct addrinfo *a)
 {
-	int on = 1, ret;
+	int on = 1;
 	struct ip_mreq mreq;
 
 	memset(&mreq, 0, sizeof(struct ip_mreq));
-
-	ret = inet_pton(AF_INET, hostname, &mreq.imr_multiaddr);
-	if (ret < 1) {
-		err_sys_die(EXIT_FAILMISC, "Cannot convert address (%s) into numeric representation",
-				hostname);
-	}
-
+	memcpy(&mreq.imr_multiaddr, &(((struct sockaddr_in *)a->ai_addr)->sin_addr), sizeof(struct in_addr));
 	mreq.imr_interface.s_addr = INADDR_ANY;
 
 	xsetsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &on, sizeof(int), "IP_MULTICAST_LOOP");
@@ -299,19 +295,15 @@ static void enable_multicast_v4(int fd, const char *hostname)
 	pr_debug("add membership to IPv4 multicast group");
 }
 
-static void enable_multicast_v6(int fd, const char *hostname)
+static void enable_multicast_v6(int fd, const struct addrinfo *a)
 {
-	int on = 1, ret;
+	int on = 1;
 	struct ipv6_mreq mreq6;
 
 	memset(&mreq6, 0, sizeof(struct ipv6_mreq));
 
+	memcpy(&mreq6.ipv6mr_multiaddr, &(((struct sockaddr_in6 *)a->ai_addr)->sin6_addr), sizeof(struct in6_addr));
 	mreq6.ipv6mr_interface = 0; /* FIXME: determine interface */
-	ret = inet_pton(AF_INET6, hostname, &mreq6.ipv6mr_multiaddr);
-	if (ret < 1) {
-		err_sys_die(EXIT_FAILMISC, "Cannot convert address (%s) into numeric representation",
-				hostname);
-	}
 
 	xsetsockopt(fd, IPPROTO_IPV6, IPV6_MULTICAST_LOOP,
 			&on, sizeof(int), "IPV6_MULTICAST_LOOP");
@@ -323,7 +315,7 @@ static void enable_multicast_v6(int fd, const char *hostname)
 
 }
 
-static int socket_bind(const struct addrinfo *a, const char *hostname)
+static int socket_bind(const struct addrinfo *a)
 {
 	int ret, on = 1;
 	int fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
@@ -341,10 +333,10 @@ static int socket_bind(const struct addrinfo *a, const char *hostname)
 
 	switch (a->ai_family) {
 		case AF_INET:
-			enable_multicast_v4(fd, hostname);
+			enable_multicast_v4(fd, a);
 				break;
 		case AF_INET6:
-			enable_multicast_v6(fd, hostname);
+			enable_multicast_v6(fd, a);
 		default:
 			abort();
 			break;
@@ -355,14 +347,26 @@ static int socket_bind(const struct addrinfo *a, const char *hostname)
 	return fd;
 }
 
-int init_passive_socket(const char *addr, const char *port, int use_ipv6)
+static int set_non_blocking(int fd)
+{
+	int flags;
+
+	flags = fcntl(fd, F_GETFL, 0);
+	if (flags < 0)
+		return FAILURE;
+
+	flags = fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+	if (flags < 0)
+		return FAILURE;
+
+	return SUCCESS;
+}
+
+int init_passive_socket(const char *addr, const char *port, int must_block)
 {
 	int fd = -1, ret;
 	struct addrinfo hosthints, *hostres, *addrtmp;
-	struct ip_mreq mreq;
-	struct ipv6_mreq mreq6;
 	char addr_name[NI_MAXHOST];
-
 
 	memset(&hosthints, 0, sizeof(struct addrinfo));
 
@@ -383,15 +387,14 @@ int init_passive_socket(const char *addr, const char *port, int use_ipv6)
 			err_msg("failure for getnameinfo: %d ", ret);
 		}
 
-		pr_debug("try socket with %s", addr_name);
+		pr_debug("try to open a passive socket with multicast address %s",
+				 addr_name);
 
-		fd = socket_bind(addrtmp, addr);
+		fd = socket_bind(addrtmp);
 		if (fd < 0) {
 			pr_debug("failed create a socket");
 			continue;
 		}
-
-		pr_debug("succeeded");
 
 		break;
 	}
@@ -401,50 +404,421 @@ int init_passive_socket(const char *addr, const char *port, int use_ipv6)
 	}
 
 
-#if 0
-	/* validate that the address is a valid multicast
-	 * address */
-	switch(hosthints.ai_family) {
-		case AF_INET6:
-			if (!IN6_IS_ADDR_MULTICAST(&mreq6.ipv6mr_multiaddr))
-				err_msg_die(EXIT_FAILNET,
-						"You didn't specify an valid IPv6 multicast address (%s)!",
-						addr);
-			mreq6.ipv6mr_interface = 0;
-			break;
-		case AF_INET:
-			if (!IN_MULTICAST(ntohl(mreq.imr_multiaddr.s_addr)))
-				err_msg_die(EXIT_FAILNET,
-						"You didn't specify an valid IPv4 multicast address (%s)!",
-						addr);
-			mreq.imr_interface.s_addr = INADDR_ANY;
-			break;
-		default:
-			abort();
-			break;
-	}
-#endif
+	/* set nonblocking mode */
+	if (!must_block)
+		set_non_blocking(fd);
 
 	return fd;
-
 }
 
-int server_mode(const char *filename)
+struct client_message {
+	uint16_t port;
+};
+
+struct file_hndl {
+	const char *name;
+	off_t size;
+};
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+static struct file_hndl *init_file_hndl(const char *filename)
 {
-	int pfd;
+	int ret;
+	struct file_hndl *file_hndl;
+	struct stat statb;
 
-	printf("netpp [server mode, serving file %s]\n", filename);
+	file_hndl = xzalloc(sizeof(*file_hndl));
 
-	pfd = init_passive_socket(LISTENADDRESS, PORT, 1);
+	file_hndl->name = filename;
 
-	sleep(10);
+	ret = stat(filename, &statb);
+	if (ret < 0) {
+		err_sys_die(EXIT_FAILFILE, "Cannot open file %s!", filename);
+	}
+
+	file_hndl->size = statb.st_size;
+
+	pr_debug("serving file %s of size %u byte", filename, file_hndl->size);
+
+	if (!S_ISREG(statb.st_mode)) {
+		err_msg_die(EXIT_FAILFILE, "File %s is no regular file, giving up!", filename);
+	}
+
+	return file_hndl;
+}
+
+static void free_file_hndl(struct file_hndl *file_hndl)
+{
+	free(file_hndl);
+}
+
+static int init_active_socket(const char *addr, const char *port)
+{
+	struct addrinfo hints, *res0, *res;
+	int err;
+	int sock;
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_socktype = SOCK_DGRAM;
+	hints.ai_family   = AF_UNSPEC;
+
+	if ((err = getaddrinfo(addr, port, &hints, &res0)) != 0) {
+		printf("error %d\n", err);
+		return 1;
+	}
+
+	for (res=res0; res!=NULL; res=res->ai_next) {
+		sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+		if (sock < 0) {
+			continue;
+		}
+
+		if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
+			close(sock);
+			continue;
+		}
+
+		break;
+	}
+
+	if (res == NULL) {
+		/* could not create a valid connection */
+		fprintf(stderr, "failed\n");
+
+		return 1;
+	}
+
+	freeaddrinfo(res0);
+
+	set_non_blocking(sock);
+
+	return sock;
+}
+
+struct srv_announce_data {
+	uint32_t size;
+	uint32_t filename_len;
+	char *name;
+};
+
+static char *xstrdup(const char *s)
+{
+	char *ptr = strdup(s);
+	if (!ptr)
+		err_sys_die(EXIT_FAILMEM, "failed to duplicate string");
+
+	return ptr;
+}
+
+#define	TLV_SKIPN(p, n) do { p += n; } while (0)
+#define	TLV_SKIP2(p) TLV_SKIPN(p, 2)
+#define	TLV_SKIP4(p) TLV_SKIPN(p, 4)
+
+#define	TLV_WRITE2(p, n) do { *(int16_t *)p = n; TLV_SKIP2(p); } while (0)
+#define	TLV_WRITE4(p, n) do { *(int32_t *)p = n; TLV_SKIP4(p); } while (0)
+
+#define	TLV_READ2(p, n) do { n = *(int16_t *)p; TLV_SKIP2(p); } while (0)
+#define	TLV_READ4(p, n) do { n = *(int32_t *)p; TLV_SKIP4(p); } while (0)
+
+static int decode_announce_pdu(char *pdu, size_t pdu_len, struct srv_announce_data **sad)
+{
+	char *ptr = pdu;
+	struct srv_announce_data *sadt;
+
+	if (pdu_len < 4 + 4 + 1) {
+		pr_debug("announced file should be at least one character in name");
+		return FAILURE;
+	}
+
+	sadt = xzalloc(sizeof(*sadt));
+
+	TLV_READ4(ptr, sadt->size);
+	sadt->size = ntohl(sadt->size);
+	pr_debug("announced file size: %u bytes", sadt->size);
+
+	TLV_READ4(ptr, sadt->filename_len);
+	sadt->filename_len = ntohl(sadt->filename_len);
+	pr_debug("announced file len: %u bytes", sadt->filename_len);
+
+	if (pdu_len < 4 + 4 + sadt->filename_len) {
+		pr_debug("announced filename is %u bytes but transmitted only %u",
+				  sadt->filename_len, pdu_len - 4 - 4);
+		free(sadt);
+		return FAILURE;
+	}
+
+	sadt->name = xstrdup(ptr);
+
+	*sad = sadt;
+
+	return SUCCESS;
+}
+
+static void free_srv_announce_data(struct srv_announce_data *s)
+{
+	assert(s && s->name);
+
+	free(s->name); free(s);
+}
+
+static size_t encode_announce_pdu(unsigned char *pdu,
+							   size_t max_pdu_len, const struct file_hndl *file_hndl)
+{
+	unsigned char *ptr = pdu;
+	size_t len = 0;
+
+
+	TLV_WRITE4(ptr, htonl(file_hndl->size));
+	len += 4;
+
+	TLV_WRITE4(ptr, htonl(strlen(file_hndl->name) + 1));
+	len += 4;
+
+	if (strlen(file_hndl->name) + 1 >= max_pdu_len - len) {
+		err_msg_die(EXIT_FAILINT, "remaining buffer (%d byte) to small to "
+					"transmit filename (%d byte)!",
+					max_pdu_len - len, strlen(file_hndl->name));
+	}
+
+	memcpy(ptr, file_hndl->name, strlen(file_hndl->name) + 1);
+
+	len += strlen(file_hndl->name) + 1;
+
+	return len;
+}
+
+#define	ANNOUNCE_PDU_LEN_MAX 512
+
+static int srv_tx_announce_pdu(int fd, const struct file_hndl *file_hndl)
+{
+	ssize_t ret; size_t len;
+	unsigned char buf[ANNOUNCE_PDU_LEN_MAX];
+
+	memset(buf, 0, sizeof(buf));
+
+	len = encode_announce_pdu(buf, ANNOUNCE_PDU_LEN_MAX, file_hndl);
+
+	ret = write(fd, buf, len);
+	if (ret == -1 && !(errno == EWOULDBLOCK)) {
+		err_sys_die(EXIT_FAILNET, "Cannot send announcement message");
+	}
+
+	return SUCCESS;
+}
+
+#define	RX_BUF 512
+
+struct client_request_info {
+	struct sockaddr_storage sa_storage;
+	ssize_t ss_len;
+	struct client_message client_message;
+};
+
+static int srv_try_rx_client_pdu(int pfd, struct client_request_info **cri)
+{
+	ssize_t ret;
+	unsigned char rx_buf[RX_BUF];
+	struct sockaddr_storage ss;
+	socklen_t ss_len = sizeof(ss);
+	struct client_request_info *client_request_info;
+
+	ret = recvfrom(pfd, rx_buf, RX_BUF, 0, (struct sockaddr *)&ss, &ss_len);
+	if (ret < 0 && !(errno == EWOULDBLOCK)) {
+		err_sys_die(EXIT_FAILNET, "failed to read()");
+	}
+
+	if (ret != sizeof(struct client_message)) {
+		pr_debug("received a answer that do not match "
+				"our expectations, (is %d, should %d) ignoring it",
+				ret, sizeof(struct client_message));
+		return FAILURE;
+	}
+
+	client_request_info = xzalloc(sizeof(*client_request_info));
+	memcpy(&client_request_info->client_message,
+		   rx_buf, sizeof(struct client_message));
+	client_request_info->ss_len = ss_len;
+
+	/* convert message into host byte order */
+	client_request_info->client_message.port =
+		htons(client_request_info->client_message.port);
+
+	*cri = client_request_info;
+
+	pr_debug("client requested to open a new TCP data socket on port %u",
+			  client_request_info->client_message.port);
+
+	return SUCCESS;
+}
+
+static void free_client_request_info(struct client_request_info *c)
+{
+	free(c);
+}
+
+static void srv_tx_file(const struct client_request_info *cri, const char *file)
+{
+	int ret;
+	char peer[1024], portstr[8];
+
+	(void) file;
+
+	ret = getnameinfo((struct sockaddr *)&cri->sa_storage, cri->ss_len, peer,
+					  sizeof(peer), portstr, sizeof(portstr), NI_NUMERICSERV|NI_NUMERICHOST);
+
+	pr_debug("accept from %s:%s", peer, portstr);
+}
+
+/* In server mode the program sends in regular interval
+ * a UDP announcement PDU to a well known multicast address.
+ * If a client want to receive this data the client opens
+ * a TCP socket and inform the server that he want this file,
+ * we push this file to the server */
+int server_mode(char *filename)
+{
+	int pfd, afd, ret;
+	struct client_request_info *client_request_info;
+	struct file_hndl *file_hndl;
+	int must_block = 0;
+
+	if (!filename)
+		err_sys_die(EXIT_FAILOPT, "Failed to strdup()");
+
+	pr_debug("netpp [server mode, serving file %s]", filename);
+
+	file_hndl = init_file_hndl(filename);
+
+	pfd = init_passive_socket(LISTENADDRESS, PORT, must_block);
+	afd = init_active_socket(LISTENADDRESS, PORT);
+
+
+	while (23) {
+
+		ret = srv_tx_announce_pdu(afd, file_hndl);
+		if (ret != SUCCESS) {
+			err_msg_die(EXIT_FAILNET, "Failure in announcement broadcast");
+		}
+
+		while (666) { /* handle all backloged client requests */
+			ret = srv_try_rx_client_pdu(pfd, &client_request_info);
+			if (ret != SUCCESS)
+				break;
+
+			srv_tx_file(client_request_info, filename);
+
+			free_client_request_info(client_request_info);
+		}
+
+		sleep(1);
+	}
+
+	free_file_hndl(file_hndl);
+	free(filename);
+	close(pfd);
 
 	return EXIT_SUCCESS;
 }
 
+struct srv_announcement_info {
+	struct sockaddr_storage srv_ss;
+	ssize_t server_ss_len;
+	char *srv_announcement_pdu;
+	size_t srv_announcement_pdu_len;
+};
+
+static int client_try_read_announcement_pdu(int pfd, struct srv_announcement_info **crl)
+{
+	ssize_t ret;
+	char rx_buf[RX_BUF];
+	struct sockaddr_storage ss;
+	socklen_t ss_len = sizeof(ss);
+	//struct srv_announcement_info *srv_announcement_info;
+	struct srv_announce_data *sad;
+
+	(void) crl;
+
+	ret = recvfrom(pfd, rx_buf, RX_BUF, 0, (struct sockaddr *)&ss, &ss_len);
+	if (ret < 0) {
+		err_sys_die(EXIT_FAILNET, "failed to read()");
+	}
+
+	pr_debug("received %u byte from server", ret);
+
+	ret = decode_announce_pdu(rx_buf, RX_BUF, &sad);
+	if (ret != SUCCESS) {
+		pr_debug("server announcement pdu does not match our exception, igoring it");
+		return FAILURE;
+	}
+
+	free_srv_announce_data(sad);
+
+	return SUCCESS;
+}
+
+/* client open a passive multicast socket and
+ * wait for server file announcements. If the server
+ * announce a file the client opens a random TCP port,
+ * send this port to the server and waits for the data */
 int client_mode(void)
 {
-	printf("netpp [client mode]\n");
+	int pfd, ret;
+	struct srv_announcement_info *sai;
+	int must_block = 1;
+
+	pr_debug("netpp [client mode]");
+
+	pfd = init_passive_socket(LISTENADDRESS, PORT, must_block);
+
+	while (23) {
+		ret = client_try_read_announcement_pdu(pfd, &sai);
+		if (ret != SUCCESS)
+			continue;
+
+		/* fine, we got a valid announcement! :-) */
+	}
+
+#if 0
+
+	while (23) {
+
+		annouce_pdu = client_try_read_announcement_pdu(pfd);
+		if (annouce_pdu) { /* got a proper file announcement */
+
+			/* open a passive TCP socket as the file sink */
+			ret = client_open_stream_sink(&client_data);
+			if (ret != SUCCESS) {
+				err_msg_die(EXIT_FAILNET, "Failed to create TCP socket");
+			}
+
+			/* inform the server about the newly created connection */
+			ret = client_inform_server(&client_data);
+			if (ret != SUCCESS) {
+				err_msg_die(EXIT_FAILNET, "Can't inform the server, upps!");
+			}
+
+			/* finaly receive the file */
+			ret = client_rx_file(&client_data, annouce_pdu);
+			if (ret != SUCCESS) {
+				err_msg_die(EXIT_FAILNET, "Can't receive the file, strange");
+			}
+
+			client_close_sink(&client_data);
+
+			/* and exit the program gracefully */
+			return EXIT_SUCCESS;
+		}
+		sleep(1); /* nothing to do, sleep a moment */
+	}
+
+#endif
+
+	sleep(100);
+
+	close(pfd);
 
 	return EXIT_SUCCESS;
 }
@@ -452,6 +826,11 @@ int client_mode(void)
 
 int main(int ac, char **av)
 {
+	int ret;
+
+	ret = initiate_seed();
+	if (ret != SUCCESS)
+		err_msg_die(EXIT_FAILMISC, "Cannot initialize random seed");
 
 	switch (ac) {
 		case 1:
@@ -466,6 +845,7 @@ int main(int ac, char **av)
 			break;
 	}
 
+	return FAILURE; /* should not happened */
 }
 
-/* vim: set tw=78 ts=4 sw=4 sts=4 ff=unix noet: */
+/* vim: set tw=78 ts=4 sw=4 sts=4 ff=unix noet cino=(0: */

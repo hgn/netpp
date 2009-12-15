@@ -12,7 +12,8 @@ CFLAGS := -Wall -Wextra -pipe -Wwrite-strings -Wsign-compare \
 					-Wstrict-aliasing=3 -Wswitch-default -Wswitch-enum \
 					-Wno-system-headers -Wundef -Wvolatile-register-var \
 					-Wcast-align -Wbad-function-cast -Wwrite-strings \
-					-Wold-style-definition  -Wdeclaration-after-statement
+					-Wold-style-definition  -Wdeclaration-after-statement \
+					-fstack-protector
 
 CFLAGS += -ggdb3 # -Werror
 
