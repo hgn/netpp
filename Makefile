@@ -15,7 +15,7 @@ CFLAGS := -Wall -Wextra -pipe -Wwrite-strings -Wsign-compare \
 					-Wold-style-definition  -Wdeclaration-after-statement \
 					-fstack-protector -fstrict-overflow -Wstrict-overflow=5
 
-CFLAGS += -ggdb3 -Werror
+CFLAGS += -ggdb3 # -Werror
 
 ifdef EPOLL
 	EXTRA_CFLAGS := -DHAVE_EPOLL

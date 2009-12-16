@@ -140,6 +140,28 @@ struct opts {
 	char *filename;
 };
 
+#define	OFFER_PDU_MAGIC 0x2323
+#define	OFFER_PDU_VERSION 0x01
+
+struct offer_pdu_hdr {
+	uint16_t magic;
+	uint16_t cookie;
+	uint16_t opcode;
+	uint16_t len;
+	/* tlv's follows */
+} __attribute__((packed));
+
+#define	OFFER_TLV_FILE 0x01
+#define	OFFER_TLV_SHA1 0x02
+
+struct offer_pdu_tlv_file {
+	uint16_t type;
+	uint16_t len;
+	uint32_t filesize;
+	uint32_t filename_len;
+	char filename[0]; /* must end on a 4 byte boundary */
+} __attribute__((packed));
+
 int subtime(struct timeval *op1, struct timeval *op2,
 				   struct timeval *result)
 {
@@ -509,7 +531,7 @@ static int init_active_socket(const char *addr, const char *port)
 	return sock;
 }
 
-struct srv_announce_data {
+struct srv_offer_data {
 	uint32_t size;
 	uint32_t filename_len;
 	char *name;
@@ -534,13 +556,13 @@ static char *xstrdup(const char *s)
 #define	TLV_READ2(p, n) do { n = *(int16_t *)p; TLV_SKIP2(p); } while (0)
 #define	TLV_READ4(p, n) do { n = *(int32_t *)p; TLV_SKIP4(p); } while (0)
 
-static int decode_announce_pdu(char *pdu, size_t pdu_len, struct srv_announce_data **sad)
+static int decode_offer_pdu(char *pdu, size_t pdu_len, struct srv_offer_data **sad)
 {
 	char *ptr = pdu;
-	struct srv_announce_data *sadt;
+	struct srv_offer_data *sadt;
 
 	if (pdu_len < 4 + 4 + 1) {
-		pr_debug("announced file should be at least one character in name");
+		pr_debug("offered file should be at least one character in name");
 		return FAILURE;
 	}
 
@@ -548,14 +570,14 @@ static int decode_announce_pdu(char *pdu, size_t pdu_len, struct srv_announce_da
 
 	TLV_READ4(ptr, sadt->size);
 	sadt->size = ntohl(sadt->size);
-	pr_debug("announced file size: %u bytes", sadt->size);
+	pr_debug("offered file size: %u bytes", sadt->size);
 
 	TLV_READ4(ptr, sadt->filename_len);
 	sadt->filename_len = ntohl(sadt->filename_len);
-	pr_debug("announced file len: %u bytes", sadt->filename_len);
+	pr_debug("offered file len: %u bytes", sadt->filename_len);
 
 	if (pdu_len < 4 + 4 + sadt->filename_len) {
-		pr_debug("announced filename is %u bytes but transmitted only %u",
+		pr_debug("offered filename is %u bytes but transmitted only %u",
 				  sadt->filename_len, pdu_len - 4 - 4);
 		free(sadt);
 		return FAILURE;
@@ -568,13 +590,13 @@ static int decode_announce_pdu(char *pdu, size_t pdu_len, struct srv_announce_da
 	return SUCCESS;
 }
 
-static void free_srv_announce_data(struct srv_announce_data *s)
+static void free_srv_offer_data(struct srv_offer_data *s)
 {
 	assert(s && s->name);
 	free(s->name); free(s);
 }
 
-static size_t encode_announce_pdu(unsigned char *pdu,
+static size_t encode_offer_pdu(unsigned char *pdu,
 							   size_t max_pdu_len, const struct file_hndl *file_hndl)
 {
 	unsigned char *ptr = pdu;
@@ -600,20 +622,20 @@ static size_t encode_announce_pdu(unsigned char *pdu,
 	return len;
 }
 
-#define	ANNOUNCE_PDU_LEN_MAX 512
+#define	OFFER_PDU_LEN_MAX 512
 
-static int srv_tx_announce_pdu(int fd, const struct file_hndl *file_hndl)
+static int srv_tx_offer_pdu(int fd, const struct file_hndl *file_hndl)
 {
 	ssize_t ret; size_t len;
-	unsigned char buf[ANNOUNCE_PDU_LEN_MAX];
+	unsigned char buf[OFFER_PDU_LEN_MAX];
 
 	memset(buf, 0, sizeof(buf));
 
-	len = encode_announce_pdu(buf, ANNOUNCE_PDU_LEN_MAX, file_hndl);
+	len = encode_offer_pdu(buf, OFFER_PDU_LEN_MAX, file_hndl);
 
 	ret = write(fd, buf, len);
 	if (ret == -1 && !(errno == EWOULDBLOCK)) {
-		err_sys_die(EXIT_FAILNET, "Cannot send announcement message");
+		err_sys_die(EXIT_FAILNET, "Cannot send offer message");
 	}
 
 	return SUCCESS;
@@ -683,7 +705,7 @@ static void srv_tx_file(const struct client_request_info *cri, const char *file)
 }
 
 /* In server mode the program sends in regular interval
- * a UDP announcement PDU to a well known multicast address.
+ * a UDP offer PDU to a well known multicast address.
  * If a client want to receive this data the client opens
  * a TCP socket and inform the server that he want this file,
  * we push this file to the server */
@@ -705,9 +727,9 @@ int server_mode(const struct opts *opts)
 
 	while (23) {
 
-		ret = srv_tx_announce_pdu(afd, file_hndl);
+		ret = srv_tx_offer_pdu(afd, file_hndl);
 		if (ret != SUCCESS) {
-			err_msg_die(EXIT_FAILNET, "Failure in announcement broadcast");
+			err_msg_die(EXIT_FAILNET, "Failure in offer broadcast");
 		}
 
 		while (666) { /* handle all backloged client requests */
@@ -729,21 +751,21 @@ int server_mode(const struct opts *opts)
 	return EXIT_SUCCESS;
 }
 
-struct srv_announcement_info {
+struct srv_offer_info {
 	struct sockaddr_storage srv_ss;
 	ssize_t server_ss_len;
-	char *srv_announcement_pdu;
-	size_t srv_announcement_pdu_len;
+	char *srv_offer_pdu;
+	size_t srv_offer_pdu_len;
 };
 
-static int client_try_read_announcement_pdu(int pfd, struct srv_announcement_info **crl)
+static int client_try_read_offer_pdu(int pfd, struct srv_offer_info **crl)
 {
 	ssize_t ret;
 	char rx_buf[RX_BUF];
 	struct sockaddr_storage ss;
 	socklen_t ss_len = sizeof(ss);
 	//struct srv_announcement_info *srv_announcement_info;
-	struct srv_announce_data *sad;
+	struct srv_offer_data *sad;
 
 	(void) crl;
 
@@ -754,25 +776,25 @@ static int client_try_read_announcement_pdu(int pfd, struct srv_announcement_inf
 
 	pr_debug("received %u byte from server", ret);
 
-	ret = decode_announce_pdu(rx_buf, RX_BUF, &sad);
+	ret = decode_offer_pdu(rx_buf, RX_BUF, &sad);
 	if (ret != SUCCESS) {
-		pr_debug("server announcement pdu does not match our exception, igoring it");
+		pr_debug("server offer pdu does not match our exception, igoring it");
 		return FAILURE;
 	}
 
-	free_srv_announce_data(sad);
+	free_srv_offer_data(sad);
 
 	return SUCCESS;
 }
 
 /* client open a passive multicast socket and
- * wait for server file announcements. If the server
- * announce a file the client opens a random TCP port,
+ * wait for server file offer. If the server
+ * offer a file the client opens a random TCP port,
  * send this port to the server and waits for the data */
 int client_mode(const struct opts *opts)
 {
 	int pfd, ret;
-	struct srv_announcement_info *sai;
+	struct srv_offer_info *sai;
 	int must_block = 1;
 	const char *port = opts->port ?: DEFAULT_LISTEN_PORT;
 
@@ -783,11 +805,11 @@ int client_mode(const struct opts *opts)
 	pfd = init_passive_socket(LISTENADDRESS, port, must_block);
 
 	while (23) {
-		ret = client_try_read_announcement_pdu(pfd, &sai);
+		ret = client_try_read_offer_pdu(pfd, &sai);
 		if (ret != SUCCESS)
 			continue;
 
-		/* fine, we received a valid announcement! :-) */
+		/* fine, we received a valid offer! :-) */
 	}
 
 #if 0
