@@ -13,9 +13,9 @@ CFLAGS := -Wall -Wextra -pipe -Wwrite-strings -Wsign-compare \
 					-Wno-system-headers -Wundef -Wvolatile-register-var \
 					-Wcast-align -Wbad-function-cast -Wwrite-strings \
 					-Wold-style-definition  -Wdeclaration-after-statement \
-					-fstack-protector
+					-fstack-protector -fstrict-overflow -Wstrict-overflow=5
 
-CFLAGS += -ggdb3 # -Werror
+CFLAGS += -ggdb3 -Werror
 
 ifdef EPOLL
 	EXTRA_CFLAGS := -DHAVE_EPOLL

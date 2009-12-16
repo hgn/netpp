@@ -183,7 +183,7 @@ void msg(const char *format, ...)
 static void err_doit(int sys_error, const char *file,
 					 const int line_no, const char *fmt, va_list ap)
 {
-	int     errno_save;
+	int errno_save;
 	char buf[MAXERRMSG];
 
 	errno_save = errno;
@@ -287,8 +287,7 @@ static void xgetaddrinfo(const char *node, const char *service,
 
 static void usage(const char *me)
 {
-	fprintf(stdout, "%s (-4|-6) [filename]\n",
-			me);
+	fprintf(stdout, "%s (-4|-6) (-p <port>) [filename]\n", me);
 }
 
 static void enable_multicast_v4(int fd, const struct addrinfo *a)
@@ -414,7 +413,6 @@ int init_passive_socket(const char *addr, const char *port, int must_block)
 	if (fd < 0) {
 		err_msg_die(EXIT_FAILNET, "Cannot find a valid socket!\n");
 	}
-
 
 	/* set nonblocking mode */
 	if (!must_block)
@@ -573,7 +571,6 @@ static int decode_announce_pdu(char *pdu, size_t pdu_len, struct srv_announce_da
 static void free_srv_announce_data(struct srv_announce_data *s)
 {
 	assert(s && s->name);
-
 	free(s->name); free(s);
 }
 
@@ -790,7 +787,7 @@ int client_mode(const struct opts *opts)
 		if (ret != SUCCESS)
 			continue;
 
-		/* fine, we got a valid announcement! :-) */
+		/* fine, we received a valid announcement! :-) */
 	}
 
 #if 0
@@ -889,7 +886,7 @@ int main(int ac, char **av)
 	}
 
 	if (optind >= ac) {
-		/* FIXME: handle the case where more files are given */
+		/* FIXME: catch the case where more files are given */
 		error = client_mode(opts);
 		goto out_client;
 	}
