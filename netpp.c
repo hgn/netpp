@@ -787,65 +787,149 @@ static int client_try_read_offer_pdu(int pfd, struct srv_offer_info **crl)
 	return SUCCESS;
 }
 
+/* follow IANA suggestions */
+#define	EPHEMERAL_PORT_MIN 49152
+#define	EPHEMERAL_PORT_MAX 65534
+
+static uint16_t dice_a_port(void)
+{
+	return (random() % (EPHEMERAL_PORT_MAX - EPHEMERAL_PORT_MIN)) + EPHEMERAL_PORT_MIN;
+}
+
+#define	DEFAULT_TCP_BACKLOG 6
+
+static int client_open_stream_sink(uint16_t *port, int *lfd)
+{
+	int ret, fd = -1, on = 1;
+	const char *hostname = NULL;
+	struct addrinfo hosthints, *hostres, *addrtmp;
+	uint16_t tport; char sport[16];
+
+	tport = dice_a_port();
+	snprintf(sport, sizeof(sport) - 1, "%d", tport);
+	fprintf(stderr, "port %s\n", sport);
+
+	memset(&hosthints, 0, sizeof(struct addrinfo));
+
+	hosthints.ai_family   = AF_UNSPEC;
+	hosthints.ai_socktype = SOCK_STREAM;
+	hosthints.ai_protocol = IPPROTO_TCP;
+	hosthints.ai_flags    = AI_PASSIVE | AI_ADDRCONFIG;
+
+	xgetaddrinfo(hostname, sport, &hosthints, &hostres);
+
+	for (addrtmp = hostres; addrtmp != NULL ; addrtmp = addrtmp->ai_next) {
+
+		fd = socket(addrtmp->ai_family, addrtmp->ai_socktype, addrtmp->ai_protocol);
+		if (fd < 0)
+			continue;
+
+		xsetsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on), "SO_REUSEADDR");
+
+		ret = bind(fd, addrtmp->ai_addr, addrtmp->ai_addrlen);
+		if (ret) {
+			err_sys("failed to bind TCP socket");
+			close(fd);
+			fd = -1;
+			continue;
+		}
+
+		ret = listen(fd, DEFAULT_TCP_BACKLOG);
+		if (ret < 0) {
+			err_sys("failed to call listen for TCP socket");
+			close(fd);
+			fd = -1;
+			continue;
+		}
+
+		/* great, found a valuable socket */
+		break;
+	}
+
+	if (fd < 0)
+		err_msg_die(EXIT_FAILNET, "Don't found a suitable address for binding"
+					"the TCP socket, giving up");
+
+	freeaddrinfo(hostres);
+
+	pr_debug("open a passive TCP socket on port %s", sport);
+
+	/* fill return arguments */
+	*port = tport;
+	*lfd  = fd;
+
+	return SUCCESS;
+}
+
+static int client_inform_server(const struct srv_offer_info sai, uint16_t port)
+{
+	int ret = SUCCESS;
+
+	return ret;
+}
+
+static int cli_rx_file(const struct srv_offer_info *sai)
+{
+	uint16_t port;
+	int ret, fd;
+
+	/* open a passive TCP socket as the file sink */
+	ret = client_open_stream_sink(&port, &fd);
+	if (ret != SUCCESS) {
+		err_msg_die(EXIT_FAILNET, "Failed to create TCP socket");
+	}
+
+	/* inform the server about the newly created connection */
+	ret = client_inform_server(sai, port);
+	if (ret != SUCCESS) {
+		err_msg_die(EXIT_FAILNET, "Can't inform the server, upps!");
+	}
+
+#if 0
+	/* finaly receive the file */
+	ret = client_rx_file(sai, fd);
+	if (ret != SUCCESS) {
+		err_msg_die(EXIT_FAILNET, "Can't receive the file, strange");
+	}
+
+#endif
+
+	/* close recently created server port */
+	close(fd);
+
+	/* and exit the program gracefully */
+	return EXIT_SUCCESS;
+}
+
 /* client open a passive multicast socket and
  * wait for server file offer. If the server
  * offer a file the client opens a random TCP port,
  * send this port to the server and waits for the data */
 int client_mode(const struct opts *opts)
 {
-	int pfd, ret;
-	struct srv_offer_info *sai;
-	int must_block = 1;
+	int pfd, ret, must_block = 1;
 	const char *port = opts->port ?: DEFAULT_LISTEN_PORT;
-
-	(void) opts;
 
 	pr_debug("netpp [client mode]");
 
 	pfd = init_passive_socket(LISTENADDRESS, port, must_block);
 
 	while (23) {
+		struct srv_offer_info *sai; /* XXX: free this */
+
+		/* block until we receive a offer pdu */
 		ret = client_try_read_offer_pdu(pfd, &sai);
 		if (ret != SUCCESS)
 			continue;
 
-		/* fine, we received a valid offer! :-) */
+		/* fine, we received a valid offer! We will
+		 * now open a passice TCP socket, announce this
+		 * port to the server and wait for the file from
+		 * the server. That's all ;) */
+		ret = cli_rx_file(sai);
+		if (ret != SUCCESS)
+			err_msg_die(EXIT_FAILNET, "Failure in receive the offered file");
 	}
-
-#if 0
-
-	while (23) {
-
-		annouce_pdu = client_try_read_announcement_pdu(pfd);
-		if (annouce_pdu) { /* got a proper file announcement */
-
-			/* open a passive TCP socket as the file sink */
-			ret = client_open_stream_sink(&client_data);
-			if (ret != SUCCESS) {
-				err_msg_die(EXIT_FAILNET, "Failed to create TCP socket");
-			}
-
-			/* inform the server about the newly created connection */
-			ret = client_inform_server(&client_data);
-			if (ret != SUCCESS) {
-				err_msg_die(EXIT_FAILNET, "Can't inform the server, upps!");
-			}
-
-			/* finaly receive the file */
-			ret = client_rx_file(&client_data, annouce_pdu);
-			if (ret != SUCCESS) {
-				err_msg_die(EXIT_FAILNET, "Can't receive the file, strange");
-			}
-
-			client_close_sink(&client_data);
-
-			/* and exit the program gracefully */
-			return EXIT_SUCCESS;
-		}
-		sleep(1); /* nothing to do, sleep a moment */
-	}
-
-#endif
 
 	close(pfd);
 
