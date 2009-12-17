@@ -37,7 +37,7 @@ $(TARGET): $(OBJ)
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) $(LIBS) -o $(TARGET) $(OBJ)
 
 clean:
-	-rm -f $(OBJ) $(TARGET)
+	-rm -f $(OBJ) $(TARGET) core
 
 cscope:
 	cscope -R -b

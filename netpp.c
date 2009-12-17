@@ -35,6 +35,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
+#include <sys/sendfile.h>
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -162,6 +163,15 @@ struct offer_pdu_tlv_file {
 	char filename[0]; /* must end on a 4 byte boundary */
 } __attribute__((packed));
 
+/* this message is sent from the client to the
+ * server and signals that the client received
+ * correctly a offer pdu, opens a passive TCP socket
+ * on port port and is now ready to receive the file */
+struct request_pdu_hdr {
+	uint16_t port;
+} __attribute__((packed));
+
+
 int subtime(struct timeval *op1, struct timeval *op2,
 				   struct timeval *result)
 {
@@ -185,6 +195,7 @@ int subtime(struct timeval *op1, struct timeval *op2,
 
 	return sign;
 }
+
 
 void msg(const char *format, ...)
 {
@@ -222,6 +233,7 @@ static void err_doit(int sys_error, const char *file,
 	errno = errno_save;
 }
 
+
 void x_err_ret(const char *file, int line_no, const char *fmt, ...)
 {
 	va_list ap;
@@ -251,12 +263,14 @@ static void * xmalloc(size_t size)
 	return ptr;
 }
 
+
 static void* xzalloc(size_t size)
 {
 	void *ptr = xmalloc(size);
 	memset(ptr, 0, size);
 	return ptr;
 }
+
 
 static void xsetsockopt(int s, int level, int optname,
 						const void *optval, socklen_t optlen, const char *str)
@@ -265,6 +279,14 @@ static void xsetsockopt(int s, int level, int optname,
 	if (ret)
 		err_sys_die(EXIT_FAILNET, "Can't set socketoption %s", str);
 }
+
+
+void xfstat(int filedes, struct stat *buf, const char *s)
+{
+	if (fstat(filedes, buf))
+		err_sys_die(EXIT_FAILMISC, "Can't fstat file %s", s);
+}
+
 
 static int initiate_seed(void)
 {
@@ -293,6 +315,7 @@ static int initiate_seed(void)
 	return SUCCESS;
 }
 
+
 static void xgetaddrinfo(const char *node, const char *service,
 						 struct addrinfo *hints, struct addrinfo **res)
 {
@@ -307,10 +330,12 @@ static void xgetaddrinfo(const char *node, const char *service,
 	return;
 }
 
+
 static void usage(const char *me)
 {
 	fprintf(stdout, "%s (-4|-6) (-p <port>) [filename]\n", me);
 }
+
 
 static void enable_multicast_v4(int fd, const struct addrinfo *a)
 {
@@ -327,6 +352,7 @@ static void enable_multicast_v4(int fd, const struct addrinfo *a)
 	xsetsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(struct ip_mreq), "IP_ADD_MEMBERSHIP");
 	pr_debug("add membership to IPv4 multicast group");
 }
+
 
 static void enable_multicast_v6(int fd, const struct addrinfo *a)
 {
@@ -347,6 +373,7 @@ static void enable_multicast_v6(int fd, const struct addrinfo *a)
 	pr_debug("join IPv6 multicast group");
 
 }
+
 
 static int socket_bind(const struct addrinfo *a)
 {
@@ -380,6 +407,7 @@ static int socket_bind(const struct addrinfo *a)
 	return fd;
 }
 
+
 static int set_non_blocking(int fd)
 {
 	int flags;
@@ -394,6 +422,7 @@ static int set_non_blocking(int fd)
 
 	return SUCCESS;
 }
+
 
 int init_passive_socket(const char *addr, const char *port, int must_block)
 {
@@ -443,19 +472,18 @@ int init_passive_socket(const char *addr, const char *port, int must_block)
 	return fd;
 }
 
-struct client_message {
-	uint16_t port;
-};
 
 struct file_hndl {
 	const char *name;
 	off_t size;
 };
 
+
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+
 
 static struct file_hndl *init_file_hndl(const char *filename)
 {
@@ -483,10 +511,12 @@ static struct file_hndl *init_file_hndl(const char *filename)
 	return file_hndl;
 }
 
+
 static void free_file_hndl(struct file_hndl *file_hndl)
 {
 	free(file_hndl);
 }
+
 
 static int init_active_socket(const char *addr, const char *port)
 {
@@ -526,6 +556,7 @@ static int init_active_socket(const char *addr, const char *port)
 
 	freeaddrinfo(res0);
 
+	/* XXX: is this required here */
 	set_non_blocking(sock);
 
 	return sock;
@@ -537,6 +568,7 @@ struct srv_offer_data {
 	char *name;
 };
 
+
 static char *xstrdup(const char *s)
 {
 	char *ptr = strdup(s);
@@ -545,6 +577,7 @@ static char *xstrdup(const char *s)
 
 	return ptr;
 }
+
 
 #define	TLV_SKIPN(p, n) do { p += n; } while (0)
 #define	TLV_SKIP2(p) TLV_SKIPN(p, 2)
@@ -590,11 +623,13 @@ static int decode_offer_pdu(char *pdu, size_t pdu_len, struct srv_offer_data **s
 	return SUCCESS;
 }
 
+
 static void free_srv_offer_data(struct srv_offer_data *s)
 {
 	assert(s && s->name);
 	free(s->name); free(s);
 }
+
 
 static size_t encode_offer_pdu(unsigned char *pdu,
 							   size_t max_pdu_len, const struct file_hndl *file_hndl)
@@ -622,6 +657,7 @@ static size_t encode_offer_pdu(unsigned char *pdu,
 	return len;
 }
 
+
 #define	OFFER_PDU_LEN_MAX 512
 
 static int srv_tx_offer_pdu(int fd, const struct file_hndl *file_hndl)
@@ -646,8 +682,9 @@ static int srv_tx_offer_pdu(int fd, const struct file_hndl *file_hndl)
 struct client_request_info {
 	struct sockaddr_storage sa_storage;
 	ssize_t ss_len;
-	struct client_message client_message;
+	struct request_pdu_hdr request_pdu_hdr;
 };
+
 
 static int srv_try_rx_client_pdu(int pfd, struct client_request_info **cri)
 {
@@ -662,47 +699,176 @@ static int srv_try_rx_client_pdu(int pfd, struct client_request_info **cri)
 		err_sys_die(EXIT_FAILNET, "failed to read()");
 	}
 
-	if (ret != sizeof(struct client_message)) {
+	if (ret != sizeof(struct request_pdu_hdr)) {
 		pr_debug("received a answer that do not match "
 				"our expectations, (is %d, should %d) ignoring it",
-				ret, sizeof(struct client_message));
+				ret, sizeof(struct request_pdu_hdr));
 		return FAILURE;
 	}
 
 	client_request_info = xzalloc(sizeof(*client_request_info));
-	memcpy(&client_request_info->client_message,
-		   rx_buf, sizeof(struct client_message));
+
+	/* save client request message */
+	memcpy(&client_request_info->request_pdu_hdr,
+		   rx_buf, sizeof(struct request_pdu_hdr));
+
+	/* save client address */
 	client_request_info->ss_len = ss_len;
+	memcpy(&client_request_info->sa_storage, &ss,
+		   sizeof(client_request_info->sa_storage));
 
 	/* convert message into host byte order */
-	client_request_info->client_message.port =
-		htons(client_request_info->client_message.port);
+	client_request_info->request_pdu_hdr.port =
+		htons(client_request_info->request_pdu_hdr.port);
 
 	*cri = client_request_info;
 
 	pr_debug("client requested to open a new TCP data socket on port %u",
-			  client_request_info->client_message.port);
+			  client_request_info->request_pdu_hdr.port);
 
 	return SUCCESS;
 }
+
 
 static void free_client_request_info(struct client_request_info *c)
 {
 	free(c);
 }
 
+static ssize_t xsendfile(int connected_fd, int file_fd, struct stat *stat_buf)
+{
+	ssize_t rc, write_cnt;
+	off_t offset = 0;
+	int tx_calls = 0;
+
+	pr_debug("now try to transfer the file to the peer");
+
+	write_cnt = stat_buf->st_size;
+
+	while (stat_buf->st_size - offset - 1 >= write_cnt) {
+		rc = sendfile(connected_fd, file_fd, &offset, write_cnt);
+		if (rc == -1)
+			err_sys_die(EXIT_FAILNET, "Failure in sendfile routine");
+		tx_calls++;
+	}
+	/* and write remaining bytes, if any */
+	write_cnt = stat_buf->st_size - offset - 1;
+	if (write_cnt >= 0) {
+		rc = sendfile(connected_fd, file_fd, &offset, write_cnt + 1);
+		if (rc == -1)
+			err_sys_die(EXIT_FAILNET, "Failure in sendfile routine");
+		 tx_calls++;
+	}
+
+	if (offset != stat_buf->st_size)
+		err_msg_die(EXIT_FAILNET, "Incomplete transfer from sendfile: %d of %ld bytes",
+					offset , stat_buf->st_size);
+
+	pr_debug("transmitted %d bytes with %d calls via sendfile()",
+			 stat_buf->st_size, tx_calls);
+
+	return rc;
+}
+
+static int srv_open_active_connection(const char *hostname,
+									  const struct client_request_info *cri)
+{
+	int ret, fd = -1, on = 1;
+	struct addrinfo hosthints, *hostres, *addrtmp;
+	uint16_t tport; char sport[16];
+	struct protoent *protoent;
+
+	snprintf(sport, sizeof(sport) - 1, "%d", cri->request_pdu_hdr.port);
+
+	memset(&hosthints, 0, sizeof(struct addrinfo));
+
+	hosthints.ai_family   = AF_UNSPEC;
+	hosthints.ai_socktype = SOCK_STREAM;
+	hosthints.ai_protocol = IPPROTO_TCP;
+	hosthints.ai_flags    = AI_ADDRCONFIG;
+
+	xgetaddrinfo(hostname, sport, &hosthints, &hostres);
+
+	for (addrtmp = hostres; addrtmp != NULL ; addrtmp = addrtmp->ai_next) {
+
+		fd = socket(addrtmp->ai_family, addrtmp->ai_socktype, addrtmp->ai_protocol);
+		if (fd < 0)
+			continue;
+
+		protoent = getprotobynumber(addrtmp->ai_protocol);
+		if (protoent)
+			pr_debug("socket created - protocol %s(%d)", protoent->p_name, protoent->p_proto);
+
+		ret = connect(fd, addrtmp->ai_addr, addrtmp->ai_addrlen);
+		if (ret == -1)
+			err_sys_die(EXIT_FAILNET, "Can't connect to %s", hostname);
+
+		/* great, found a valuable socket */
+		break;
+	}
+
+	if (fd < 0)
+		err_msg_die(EXIT_FAILNET, "Don't found a suitable socket to connect to the client"
+					" TCP socket, giving up");
+
+	freeaddrinfo(hostres);
+
+	pr_debug("open a passive TCP socket on port %s", sport);
+
+	return fd;
+}
+
+static int srv_open_file(const char *file)
+{
+	int fd;
+
+	fd = open(file, O_RDONLY);
+	if (fd < 0) {
+		err_sys("cannot open file %s", file);
+		return FAILURE;
+	}
+
+	return fd;
+}
+
 static void srv_tx_file(const struct client_request_info *cri, const char *file)
 {
-	int ret;
+	int ret, file_fd, net_fd;
 	char peer[1024], portstr[8];
+	struct stat stat_buf;
+
 
 	(void) file;
 
 	ret = getnameinfo((struct sockaddr *)&cri->sa_storage, cri->ss_len, peer,
-					  sizeof(peer), portstr, sizeof(portstr), NI_NUMERICSERV|NI_NUMERICHOST);
+					  sizeof(peer), portstr, sizeof(portstr),
+					  NI_NUMERICSERV | NI_NUMERICHOST);
 
-	pr_debug("accept from %s:%s", peer, portstr);
+	pr_debug("received file request pdu from %s:%s", peer, portstr);
+	pr_debug("client wait for data at TCP port %d", cri->request_pdu_hdr.port);
+
+	file_fd = srv_open_file(file);
+	if (file_fd < 0)
+		return;
+
+	net_fd = srv_open_active_connection(peer, cri);
+	if (net_fd < 0) {
+		close(file_fd);
+		err_msg("cannot open a TCP connection to the peer, ignoring this client");
+	}
+
+	xfstat(file_fd, &stat_buf, file);
+
+	ret = xsendfile(net_fd, file_fd, &stat_buf); // XXX, catch error
+
+	close(net_fd);
+	close(file_fd);
+
+	/* open active TCP connection to peer and transmit the data */
+
+	sleep(100);
 }
+
 
 /* In server mode the program sends in regular interval
  * a UDP offer PDU to a well known multicast address.
@@ -758,13 +924,13 @@ struct srv_offer_info {
 	size_t srv_offer_pdu_len;
 };
 
+
 static int client_try_read_offer_pdu(int pfd, struct srv_offer_info **crl)
 {
 	ssize_t ret;
 	char rx_buf[RX_BUF];
 	struct sockaddr_storage ss;
 	socklen_t ss_len = sizeof(ss);
-	//struct srv_announcement_info *srv_announcement_info;
 	struct srv_offer_data *sad;
 
 	(void) crl;
@@ -776,7 +942,7 @@ static int client_try_read_offer_pdu(int pfd, struct srv_offer_info **crl)
 
 	pr_debug("received %u byte from server", ret);
 
-	ret = decode_offer_pdu(rx_buf, RX_BUF, &sad);
+	ret = decode_offer_pdu(rx_buf, ret, &sad);
 	if (ret != SUCCESS) {
 		pr_debug("server offer pdu does not match our exception, igoring it");
 		return FAILURE;
@@ -787,6 +953,7 @@ static int client_try_read_offer_pdu(int pfd, struct srv_offer_info **crl)
 	return SUCCESS;
 }
 
+
 /* follow IANA suggestions */
 #define	EPHEMERAL_PORT_MIN 49152
 #define	EPHEMERAL_PORT_MAX 65534
@@ -795,6 +962,7 @@ static uint16_t dice_a_port(void)
 {
 	return (random() % (EPHEMERAL_PORT_MAX - EPHEMERAL_PORT_MIN)) + EPHEMERAL_PORT_MIN;
 }
+
 
 #define	DEFAULT_TCP_BACKLOG 6
 
@@ -807,7 +975,6 @@ static int client_open_stream_sink(uint16_t *port, int *lfd)
 
 	tport = dice_a_port();
 	snprintf(sport, sizeof(sport) - 1, "%d", tport);
-	fprintf(stderr, "port %s\n", sport);
 
 	memset(&hosthints, 0, sizeof(struct addrinfo));
 
@@ -861,14 +1028,27 @@ static int client_open_stream_sink(uint16_t *port, int *lfd)
 	return SUCCESS;
 }
 
-static int client_inform_server(const struct srv_offer_info sai, uint16_t port)
-{
-	int ret = SUCCESS;
 
-	return ret;
+static int client_inform_server(const struct srv_offer_info *sai, int afd, uint16_t port)
+{
+	ssize_t ret;
+	struct request_pdu_hdr request_pdu_hdr;
+
+	memset(&request_pdu_hdr, 0, sizeof(request_pdu_hdr));
+
+	request_pdu_hdr.port = htons(port);
+
+	/* send a mesage to sai */
+	ret = write(afd, &request_pdu_hdr, sizeof(request_pdu_hdr));
+	if (ret == -1 && !(errno == EWOULDBLOCK)) {
+		err_sys_die(EXIT_FAILNET, "Cannot send offer message");
+	}
+
+	return SUCCESS;
 }
 
-static int cli_rx_file(const struct srv_offer_info *sai)
+
+static int cli_rx_file(const struct srv_offer_info *sai, int afd)
 {
 	uint16_t port;
 	int ret, fd;
@@ -880,10 +1060,13 @@ static int cli_rx_file(const struct srv_offer_info *sai)
 	}
 
 	/* inform the server about the newly created connection */
-	ret = client_inform_server(sai, port);
+	ret = client_inform_server(sai, afd, port);
 	if (ret != SUCCESS) {
 		err_msg_die(EXIT_FAILNET, "Can't inform the server, upps!");
 	}
+
+	sleep(100000);
+
 
 #if 0
 	/* finaly receive the file */
@@ -901,21 +1084,25 @@ static int cli_rx_file(const struct srv_offer_info *sai)
 	return EXIT_SUCCESS;
 }
 
+
 /* client open a passive multicast socket and
  * wait for server file offer. If the server
  * offer a file the client opens a random TCP port,
  * send this port to the server and waits for the data */
 int client_mode(const struct opts *opts)
 {
-	int pfd, ret, must_block = 1;
+	int pfd, afd, ret, must_block = 1;
 	const char *port = opts->port ?: DEFAULT_LISTEN_PORT;
 
 	pr_debug("netpp [client mode]");
 
 	pfd = init_passive_socket(LISTENADDRESS, port, must_block);
+	afd = init_active_socket(LISTENADDRESS, port);
 
 	while (23) {
 		struct srv_offer_info *sai; /* XXX: free this */
+
+		pr_debug("wait to receive a valid offer message from a server");
 
 		/* block until we receive a offer pdu */
 		ret = client_try_read_offer_pdu(pfd, &sai);
@@ -926,7 +1113,7 @@ int client_mode(const struct opts *opts)
 		 * now open a passice TCP socket, announce this
 		 * port to the server and wait for the file from
 		 * the server. That's all ;) */
-		ret = cli_rx_file(sai);
+		ret = cli_rx_file(sai, afd);
 		if (ret != SUCCESS)
 			err_msg_die(EXIT_FAILNET, "Failure in receive the offered file");
 	}
@@ -935,6 +1122,7 @@ int client_mode(const struct opts *opts)
 
 	return EXIT_SUCCESS;
 }
+
 
 int main(int ac, char **av)
 {
