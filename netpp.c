@@ -603,11 +603,9 @@ static int decode_offer_pdu(char *pdu, size_t pdu_len, struct srv_offer_data **s
 
 	TLV_READ4(ptr, sadt->size);
 	sadt->size = ntohl(sadt->size);
-	pr_debug("offered file size: %u bytes", sadt->size);
 
 	TLV_READ4(ptr, sadt->filename_len);
 	sadt->filename_len = ntohl(sadt->filename_len);
-	pr_debug("offered file len: %u bytes", sadt->filename_len);
 
 	if (pdu_len < 4 + 4 + sadt->filename_len) {
 		pr_debug("offered filename is %u bytes but transmitted only %u",
@@ -615,6 +613,8 @@ static int decode_offer_pdu(char *pdu, size_t pdu_len, struct srv_offer_data **s
 		free(sadt);
 		return FAILURE;
 	}
+
+	pr_debug("offered file \"%s\", filesize: %u bytes", ptr, sadt->size);
 
 	sadt->name = xstrdup(ptr);
 
@@ -700,8 +700,8 @@ static int srv_try_rx_client_pdu(int pfd, struct client_request_info **cri)
 	}
 
 	if (ret != sizeof(struct request_pdu_hdr)) {
-		pr_debug("received a answer that do not match "
-				"our expectations, (is %d, should %d) ignoring it",
+		pr_debug("received a invalid client request:"
+				" is %d byte but should %d byte, I just ignore this packet",
 				ret, sizeof(struct request_pdu_hdr));
 		return FAILURE;
 	}
@@ -813,7 +813,7 @@ static int srv_open_active_connection(const char *hostname,
 
 	freeaddrinfo(hostres);
 
-	pr_debug("open a passive TCP socket on port %s", sport);
+	pr_debug("open a active TCP socket on port %s to transmit this file", sport);
 
 	return fd;
 }
@@ -1015,7 +1015,7 @@ static int client_open_stream_sink(uint16_t *port, int *lfd)
 
 	freeaddrinfo(hostres);
 
-	pr_debug("open a passive TCP socket on port %s", sport);
+	pr_debug("open a passive TCP socket on port %s to receive this file", sport);
 
 	/* fill return arguments */
 	*port = tport;
@@ -1061,7 +1061,7 @@ static int client_wait_for_accept(int fd)
 		err_msg("getnameinfo error: %s",  gai_strerror(ret));
 
 
-	pr_debug("accept from %s:%s", peer, portstr);
+	pr_debug("accept connection from host %s via remote port %s", peer, portstr);
 
 	return connected_fd;
 }
