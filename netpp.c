@@ -317,19 +317,32 @@ static int initiate_seed(void)
 
 
 static void xgetaddrinfo(const char *node, const char *service,
-						 struct addrinfo *hints, struct addrinfo **res)
+		struct addrinfo *hints, struct addrinfo **res)
 {
 	int ret;
 
 	ret = getaddrinfo(node, service, hints, res);
 	if (unlikely(ret != 0)) {
 		err_msg_die(EXIT_FAILNET, "Call to getaddrinfo() failed: %s!\n",
-					(ret == EAI_SYSTEM) ?  strerror(errno) : gai_strerror(ret));
+				(ret == EAI_SYSTEM) ?  strerror(errno) : gai_strerror(ret));
 	}
 
 	return;
 }
 
+static void xgetnameinfo(const struct sockaddr *sa, socklen_t salen,
+		char *host, size_t hostlen,
+		char *serv, size_t servlen, int flags)
+{
+	int ret;
+
+	ret = getnameinfo(sa, salen, host, hostlen, serv, servlen, flags);
+	if (unlikely((ret != 0))) {
+		err_msg_die(EXIT_FAILNET, "Call to getnameinfo() failed: %s!\n",
+				(ret == EAI_SYSTEM) ?  strerror(errno) : gai_strerror(ret));
+
+	}
+}
 
 static void usage(const char *me)
 {
@@ -442,12 +455,9 @@ int init_passive_socket(const char *addr, const char *port, int must_block)
 
 	for (addrtmp = hostres; addrtmp != NULL ; addrtmp = addrtmp->ai_next) {
 
-		ret = getnameinfo(addrtmp->ai_addr, addrtmp->ai_addrlen,
+		xgetnameinfo(addrtmp->ai_addr, addrtmp->ai_addrlen,
 						addr_name, sizeof(addr_name), NULL, 0,
 						NI_NUMERICHOST | NI_NUMERICSERV);
-		if (ret) {
-			err_msg("failure for getnameinfo: %d ", ret);
-		}
 
 		pr_debug("try to open a passive socket with multicast address %s",
 				 addr_name);
@@ -632,7 +642,7 @@ static void free_srv_offer_data(struct srv_offer_data *s)
 
 
 static size_t encode_offer_pdu(unsigned char *pdu,
-							   size_t max_pdu_len, const struct file_hndl *file_hndl)
+		size_t max_pdu_len, const struct file_hndl *file_hndl)
 {
 	unsigned char *ptr = pdu;
 	size_t len = 0;
@@ -646,8 +656,8 @@ static size_t encode_offer_pdu(unsigned char *pdu,
 
 	if (strlen(file_hndl->name) + 1 >= max_pdu_len - len) {
 		err_msg_die(EXIT_FAILINT, "remaining buffer (%d byte) to small to "
-					"transmit filename (%d byte)!",
-					max_pdu_len - len, strlen(file_hndl->name));
+				"transmit filename (%d byte)!",
+				max_pdu_len - len, strlen(file_hndl->name));
 	}
 
 	memcpy(ptr, file_hndl->name, strlen(file_hndl->name) + 1);
@@ -701,7 +711,7 @@ static int srv_try_rx_client_pdu(int pfd, struct client_request_info **cri)
 
 	if (ret != sizeof(struct request_pdu_hdr)) {
 		pr_debug("received a invalid client request:"
-				" is %d byte but should %d byte, I just ignore this packet",
+				" is %d byte but should %d byte, ignoring it",
 				ret, sizeof(struct request_pdu_hdr));
 		return FAILURE;
 	}
@@ -771,7 +781,7 @@ static ssize_t xsendfile(int connected_fd, int file_fd, struct stat *stat_buf)
 }
 
 static int srv_open_active_connection(const char *hostname,
-									  const struct client_request_info *cri)
+		const struct client_request_info *cri)
 {
 	int ret, fd = -1, on = 1;
 	struct addrinfo hosthints, *hostres, *addrtmp;
@@ -797,7 +807,8 @@ static int srv_open_active_connection(const char *hostname,
 
 		protoent = getprotobynumber(addrtmp->ai_protocol);
 		if (protoent)
-			pr_debug("socket created - protocol %s(%d)", protoent->p_name, protoent->p_proto);
+			pr_debug("socket created - protocol %s(%d)",
+					protoent->p_name, protoent->p_proto);
 
 		ret = connect(fd, addrtmp->ai_addr, addrtmp->ai_addrlen);
 		if (ret == -1)
@@ -808,8 +819,9 @@ static int srv_open_active_connection(const char *hostname,
 	}
 
 	if (fd < 0)
-		err_msg_die(EXIT_FAILNET, "Don't found a suitable socket to connect to the client"
-					" TCP socket, giving up");
+		err_msg_die(EXIT_FAILNET,
+				"Don't found a suitable socket to connect to the client"
+				" TCP socket, giving up");
 
 	freeaddrinfo(hostres);
 
@@ -840,9 +852,9 @@ static void srv_tx_file(const struct client_request_info *cri, const char *file)
 
 	(void) file;
 
-	ret = getnameinfo((struct sockaddr *)&cri->sa_storage, cri->ss_len, peer,
-					  sizeof(peer), portstr, sizeof(portstr),
-					  NI_NUMERICSERV | NI_NUMERICHOST);
+	xgetnameinfo((struct sockaddr *)&cri->sa_storage, cri->ss_len, peer,
+			sizeof(peer), portstr, sizeof(portstr),
+			NI_NUMERICSERV | NI_NUMERICHOST);
 
 	pr_debug("received file request pdu from %s:%s", peer, portstr);
 	pr_debug("client wait for data at TCP port %d", cri->request_pdu_hdr.port);
@@ -1056,7 +1068,7 @@ static int client_wait_for_accept(int fd)
 		err_sys_die(EXIT_FAILNET, "accept");
 
 	ret = getnameinfo((struct sockaddr *)&sa, sa_len, peer,
-					  sizeof(peer), portstr, sizeof(portstr), NI_NUMERICSERV|NI_NUMERICHOST);
+			sizeof(peer), portstr, sizeof(portstr), NI_NUMERICSERV|NI_NUMERICHOST);
 	if (ret != 0)
 		err_msg("getnameinfo error: %s",  gai_strerror(ret));
 
@@ -1260,4 +1272,4 @@ out_client:
 	return error;
 }
 
-/* vim: set tw=78 ts=4 sw=4 sts=4 ff=unix noet cino=(0: */
+/* vim: set tw=78 ts=8 sw=8 sts=8 ff=unix noet: */
