@@ -863,10 +863,6 @@ static void srv_tx_file(const struct client_request_info *cri, const char *file)
 
 	close(net_fd);
 	close(file_fd);
-
-	/* open active TCP connection to peer and transmit the data */
-
-	sleep(100);
 }
 
 
@@ -1047,6 +1043,74 @@ static int client_inform_server(const struct srv_offer_info *sai, int afd, uint1
 	return SUCCESS;
 }
 
+static int client_wait_for_accept(int fd)
+{
+	int ret;
+	struct sockaddr_storage sa;
+	socklen_t sa_len = sizeof(sa);
+	char peer[1024], portstr[8];
+	int connected_fd = -1;
+
+	connected_fd = accept(fd, (struct sockaddr *) &sa, &sa_len);
+	if (connected_fd == -1)
+		err_sys_die(EXIT_FAILNET, "accept");
+
+	ret = getnameinfo((struct sockaddr *)&sa, sa_len, peer,
+					  sizeof(peer), portstr, sizeof(portstr), NI_NUMERICSERV|NI_NUMERICHOST);
+	if (ret != 0)
+		err_msg("getnameinfo error: %s",  gai_strerror(ret));
+
+
+	pr_debug("accept from %s:%s", peer, portstr);
+
+	return connected_fd;
+}
+
+static int client_read_and_save_file(const struct srv_offer_info *sai, int fd)
+{
+	int buflen; // XXX: make this configurable
+	char *buf;
+	ssize_t rc;
+	unsigned long rx_calls = 0;
+	unsigned long rx_bytes = 0;
+
+	buflen = 2048;
+
+	buf = xmalloc(buflen);
+
+	while ((rc = read(fd, buf, buflen)) > 0) {
+		ssize_t ret;
+		rx_calls++;
+		rx_bytes += rc;
+		do {
+			ret = write(STDOUT_FILENO, buf, rc);
+		} while (ret == -1 && errno == EINTR);
+
+		if (ret != rc) {
+			err_sys("write failed");
+			break;
+		}
+	}
+
+	free(buf);
+
+	return SUCCESS;
+}
+
+
+static int client_rx_file(const struct srv_offer_info *sai, int fd)
+{
+	int connected_fd;
+
+	connected_fd = client_wait_for_accept(fd);
+
+	client_read_and_save_file(sai, connected_fd);
+
+	close(connected_fd);
+
+	return SUCCESS;
+}
+
 
 static int cli_rx_file(const struct srv_offer_info *sai, int afd)
 {
@@ -1065,17 +1129,11 @@ static int cli_rx_file(const struct srv_offer_info *sai, int afd)
 		err_msg_die(EXIT_FAILNET, "Can't inform the server, upps!");
 	}
 
-	sleep(100000);
-
-
-#if 0
 	/* finaly receive the file */
 	ret = client_rx_file(sai, fd);
 	if (ret != SUCCESS) {
 		err_msg_die(EXIT_FAILNET, "Can't receive the file, strange");
 	}
-
-#endif
 
 	/* close recently created server port */
 	close(fd);
@@ -1114,8 +1172,10 @@ int client_mode(const struct opts *opts)
 		 * port to the server and wait for the file from
 		 * the server. That's all ;) */
 		ret = cli_rx_file(sai, afd);
-		if (ret != SUCCESS)
-			err_msg_die(EXIT_FAILNET, "Failure in receive the offered file");
+		if (ret == SUCCESS) {
+			pr_debug("file transfer completed, exiting now");
+			break;
+		}
 	}
 
 	close(pfd);
