@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <fcntl.h>
 #include <string.h>
 #include <unistd.h>
@@ -30,19 +31,15 @@
 #include <assert.h>
 #include <inttypes.h>
 #include <getopt.h>
+#include <signal.h>
 
-#include <sys/types.h>
-#include <sys/socket.h>
 #include <arpa/inet.h>
-
-#include <sys/sendfile.h>
-
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/sendfile.h>
 
 #include <limits.h>
 #include <netdb.h>
-#include <stdarg.h>
 
 #ifdef HAVE_RDTSCLL
 # include <linux/timex.h>
@@ -58,6 +55,30 @@
 # define __always_inline __inline __attribute__ ((__always_inline__))
 #else
 # define __always_inline __inline
+#endif
+
+/*
+ * See if our compiler is known to support flexible array members.
+ */
+#ifndef FLEX_ARRAY
+#if defined(__STDC_VERSION__) && \
+	(__STDC_VERSION__ >= 199901L) && \
+	(!defined(__SUNPRO_C) || (__SUNPRO_C > 0x580))
+# define FLEX_ARRAY /* empty */
+#elif defined(__GNUC__)
+# if (__GNUC__ >= 3)
+#  define FLEX_ARRAY /* empty */
+# else
+#  define FLEX_ARRAY 0 /* older GNU extension */
+# endif
+#endif
+
+/*
+ * Otherwise, default to safer but a bit wasteful traditional style
+ */
+#ifndef FLEX_ARRAY
+# define FLEX_ARRAY 1
+#endif
 #endif
 
 #ifndef ULLONG_MAX
@@ -84,6 +105,12 @@
 # define unlikely(x) __builtin_expect(!!(x), 0)
 #endif
 
+#ifdef DEBUG
+static const int debug_enabled = 1;
+#else
+static const int debug_enabled = 0;
+#endif
+
 #define err_msg(format, args...) \
         do { \
                 x_err_ret(__FILE__, __LINE__,  format , ## args); \
@@ -103,16 +130,18 @@
 #define err_msg_die(exitcode, format, args...) \
         do { \
                 x_err_ret(__FILE__, __LINE__,  format , ## args); \
+				exit( exitcode ); \
         } while (0)
 
 #define pr_debug(format, args...) \
         do { \
-                if (DEBUG) \
+                if (debug_enabled) \
                         msg(format, ##args); \
 		} while (0)
 
 /* determine the size of an array */
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#define BITSIZEOF(x)  (CHAR_BIT * sizeof(x))
 
 #define EXIT_OK         EXIT_SUCCESS
 #define EXIT_FAILMEM    1
@@ -136,6 +165,7 @@
 
 struct opts {
 	int wanted_af_family;
+	int rx_buf_size;
 	char *me;
 	char *port;
 	char *filename;
@@ -171,6 +201,9 @@ struct request_pdu_hdr {
 	uint16_t port;
 } __attribute__((packed));
 
+struct ctx {
+	struct opts *opts;
+};
 
 int subtime(struct timeval *op1, struct timeval *op2,
 				   struct timeval *result)
@@ -293,6 +326,317 @@ void xfstat(int filedes, struct stat *buf, const char *s)
 		err_sys_die(EXIT_FAILMISC, "Can't fstat file %s", s);
 }
 
+unsigned long long xstrtoull(const char *str)
+{
+	char *endptr;
+	long long val;
+
+	errno = 0;
+	val = strtoll(str, &endptr, 10);
+	if ((errno == ERANGE && (val == LONG_MAX || val == LONG_MIN))
+			|| (errno != 0 && val == 0)) {
+		err_sys_die(EXIT_FAILURE, "strtoll failure");
+	}
+
+	if (endptr == str) {
+		err_msg_die(EXIT_FAILURE, "No digits found in commandline");
+	}
+
+	return val;
+}
+
+static int xatoi(const char *str)
+{
+	long val;
+	char *endptr;
+
+	val = strtol(str, &endptr, 10);
+	if ((val == LONG_MIN || val == LONG_MAX) && errno != 0)
+		err_sys_die(EXIT_FAILURE, "strtoll failure");
+
+	if (endptr == str)
+		err_msg_die(EXIT_FAILURE, "No digits found in commandline");
+
+	if (val > INT_MAX) {
+		err_msg("xatoi: value %ld to large to fit into a integer "
+				"- process with INT_MAX!", val);
+		return INT_MAX;
+	} else if (val < INT_MIN) {
+		err_msg("xatoi: value %ld to small to fit into a integer "
+				"- process with INT_MIN!", val);
+		return INT_MIN;
+	}
+
+	if ('\0' != *endptr)
+		err_msg_die(EXIT_FAILURE,
+				"To many characters on input: \"%s\"", str);
+
+	return val;
+}
+
+
+/*******/
+
+#define TP_IDX_MAX      8
+
+struct throughput {
+	off_t curr_total;
+	off_t prev_total;
+	struct timeval prev_tv;
+	unsigned int avg_bytes;
+	unsigned int avg_misecs;
+	unsigned int last_bytes[TP_IDX_MAX];
+	unsigned int last_misecs[TP_IDX_MAX];
+	unsigned int idx;
+	char display[32];
+};
+
+struct progress {
+	const char *title;
+	int last_value;
+	unsigned total;
+	unsigned last_percent;
+	unsigned delay;
+	unsigned delayed_percent_treshold;
+	struct throughput *throughput;
+};
+
+static struct progress *progress;
+static volatile int progress_update;
+
+static void progress_interval(int signum __attribute__((unused)))
+{
+	progress_update = 1;
+}
+
+static void set_progress_signal(void)
+{
+	struct sigaction sa;
+	struct itimerval v;
+
+	progress_update = 0;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = progress_interval;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = SA_RESTART;
+	sigaction(SIGALRM, &sa, NULL);
+
+	v.it_interval.tv_sec = 1;
+	v.it_interval.tv_usec = 0;
+	v.it_value = v.it_interval;
+	setitimer(ITIMER_REAL, &v, NULL);
+}
+
+static void clear_progress_signal(void)
+{
+	struct itimerval v = {{0,},};
+	setitimer(ITIMER_REAL, &v, NULL);
+	signal(SIGALRM, SIG_IGN);
+	progress_update = 0;
+}
+
+static int display(struct progress *progress, unsigned n, const char *done)
+{
+	const char *eol, *tp;
+
+	if (progress->delay) {
+		if (!progress_update || --progress->delay)
+			return 0;
+		if (progress->total) {
+			unsigned percent = n * 100 / progress->total;
+			if (percent > progress->delayed_percent_treshold) {
+				/* inhibit this progress report entirely */
+				clear_progress_signal();
+				progress->delay = -1;
+				progress->total = 0;
+				return 0;
+			}
+		}
+	}
+
+	progress->last_value = n;
+	tp = (progress->throughput) ? progress->throughput->display : "";
+	eol = done ? done : "   \r";
+	if (progress->total) {
+		unsigned percent = n * 100 / progress->total;
+		if (percent != progress->last_percent || progress_update) {
+			progress->last_percent = percent;
+			fprintf(stderr, "%s: %3u%% (%u/%u)%s%s",
+				progress->title, percent, n,
+				progress->total, tp, eol);
+			fflush(stderr);
+			progress_update = 0;
+			return 1;
+		}
+	} else if (progress_update) {
+		fprintf(stderr, "%s: %u%s%s", progress->title, n, tp, eol);
+		fflush(stderr);
+		progress_update = 0;
+		return 1;
+	}
+
+	return 0;
+}
+
+static void throughput_string(struct throughput *tp, off_t total,
+			      unsigned int rate)
+{
+	int l = sizeof(tp->display);
+	if (total > 1 << 30) {
+		l -= snprintf(tp->display, l, ", %u.%2.2u GiB",
+			      (int)(total >> 30),
+			      (int)(total & ((1 << 30) - 1)) / 10737419);
+	} else if (total > 1 << 20) {
+		int x = total + 5243;  /* for rounding */
+		l -= snprintf(tp->display, l, ", %u.%2.2u MiB",
+			      x >> 20, ((x & ((1 << 20) - 1)) * 100) >> 20);
+	} else if (total > 1 << 10) {
+		int x = total + 5;  /* for rounding */
+		l -= snprintf(tp->display, l, ", %u.%2.2u KiB",
+			      x >> 10, ((x & ((1 << 10) - 1)) * 100) >> 10);
+	} else {
+		l -= snprintf(tp->display, l, ", %u bytes", (int)total);
+	}
+
+	if (rate > 1 << 10) {
+		int x = rate + 5;  /* for rounding */
+		snprintf(tp->display + sizeof(tp->display) - l, l,
+			 " | %u.%2.2u MiB/s",
+			 x >> 10, ((x & ((1 << 10) - 1)) * 100) >> 10);
+	} else if (rate)
+		snprintf(tp->display + sizeof(tp->display) - l, l,
+			 " | %u KiB/s", rate);
+}
+
+void display_throughput(struct progress *progress, off_t total)
+{
+	struct throughput *tp;
+	struct timeval tv;
+	unsigned int misecs;
+
+	if (!progress)
+		return;
+	tp = progress->throughput;
+
+	gettimeofday(&tv, NULL);
+
+	if (!tp) {
+		progress->throughput = tp = calloc(1, sizeof(*tp));
+		if (tp) {
+			tp->prev_total = tp->curr_total = total;
+			tp->prev_tv = tv;
+		}
+		return;
+	}
+	tp->curr_total = total;
+
+	/*
+	 * We have x = bytes and y = microsecs.  We want z = KiB/s:
+	 *
+	 *	z = (x / 1024) / (y / 1000000)
+	 *	z = x / y * 1000000 / 1024
+	 *	z = x / (y * 1024 / 1000000)
+	 *	z = x / y'
+	 *
+	 * To simplify things we'll keep track of misecs, or 1024th of a sec
+	 * obtained with:
+	 *
+	 *	y' = y * 1024 / 1000000
+	 *	y' = y / (1000000 / 1024)
+	 *	y' = y / 977
+	 */
+	misecs = (tv.tv_sec - tp->prev_tv.tv_sec) * 1024;
+	misecs += (int)(tv.tv_usec - tp->prev_tv.tv_usec) / 977;
+
+	if (misecs > 512) {
+		unsigned int count, rate;
+
+		count = total - tp->prev_total;
+		tp->prev_total = total;
+		tp->prev_tv = tv;
+		tp->avg_bytes += count;
+		tp->avg_misecs += misecs;
+		rate = tp->avg_bytes / tp->avg_misecs;
+		tp->avg_bytes -= tp->last_bytes[tp->idx];
+		tp->avg_misecs -= tp->last_misecs[tp->idx];
+		tp->last_bytes[tp->idx] = count;
+		tp->last_misecs[tp->idx] = misecs;
+		tp->idx = (tp->idx + 1) % TP_IDX_MAX;
+
+		throughput_string(tp, total, rate);
+		if (progress->last_value != -1 && progress_update)
+			display(progress, progress->last_value, NULL);
+	}
+}
+
+int display_progress(struct progress *progress, unsigned n)
+{
+	return progress ? display(progress, n, NULL) : 0;
+}
+
+struct progress *start_progress_delay(const char *title, unsigned total,
+				       unsigned percent_treshold, unsigned delay)
+{
+	struct progress *progress = malloc(sizeof(*progress));
+	if (!progress) {
+		/* unlikely, but here's a good fallback */
+		fprintf(stderr, "%s...\n", title);
+		fflush(stderr);
+		return NULL;
+	}
+	progress->title = title;
+	progress->total = total;
+	progress->last_value = -1;
+	progress->last_percent = -1;
+	progress->delayed_percent_treshold = percent_treshold;
+	progress->delay = delay;
+	progress->throughput = NULL;
+	set_progress_signal();
+	return progress;
+}
+
+struct progress *start_progress(const char *title, unsigned total)
+{
+	return start_progress_delay(title, total, 0, 0);
+}
+
+void stop_progress_msg(struct progress **p_progress, const char *pmsg)
+{
+	struct progress *progress = *p_progress;
+	if (!progress)
+		return;
+	*p_progress = NULL;
+	if (progress->last_value != -1) {
+		/* Force the last update */
+		char buf[128], *bufp;
+		size_t len = strlen(pmsg) + 5;
+		struct throughput *tp = progress->throughput;
+
+		bufp = (len < sizeof(buf)) ? buf : xmalloc(len + 1);
+		if (tp) {
+			unsigned int rate = !tp->avg_misecs ? 0 :
+					tp->avg_bytes / tp->avg_misecs;
+			throughput_string(tp, tp->curr_total, rate);
+		}
+		progress_update = 1;
+		sprintf(bufp, ", %s.\n", pmsg);
+		display(progress, progress->last_value, bufp);
+		if (buf != bufp)
+			free(bufp);
+	}
+	clear_progress_signal();
+	free(progress->throughput);
+	free(progress);
+}
+
+void stop_progress(struct progress **p_progress)
+{
+	stop_progress_msg(p_progress, "done");
+}
+
+
+/*******/
 
 static int initiate_seed(void)
 {
@@ -340,9 +684,7 @@ static void xgetnameinfo(const struct sockaddr *sa, socklen_t salen,
 		char *host, size_t hostlen,
 		char *serv, size_t servlen, int flags)
 {
-	int ret;
-
-	ret = getnameinfo(sa, salen, host, hostlen, serv, servlen, flags);
+	int ret = getnameinfo(sa, salen, host, hostlen, serv, servlen, flags);
 	if (unlikely((ret != 0))) {
 		err_msg_die(EXIT_FAILNET, "Call to getnameinfo() failed: %s!\n",
 				(ret == EAI_SYSTEM) ? strerror(errno) : gai_strerror(ret));
@@ -352,7 +694,7 @@ static void xgetnameinfo(const struct sockaddr *sa, socklen_t salen,
 
 static void usage(const char *me)
 {
-	fprintf(stdout, "%s (-4|-6) (-p <port>) [filename]\n", me);
+	fprintf(stdout, "%s (-4|-6) (-b <rx-buffer-size>) (-p <port>) [filename]\n", me);
 }
 
 
@@ -407,7 +749,8 @@ static int socket_bind(const struct addrinfo *a)
 	if (fd < 0)
 		return -1;
 
-	xsetsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on), "SO_REUSEADDR");
+	xsetsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on,
+			sizeof(on), "SO_REUSEADDR");
 
 	ret = bind(fd, a->ai_addr, a->ai_addrlen);
 	if (ret) {
@@ -500,11 +843,6 @@ struct file_hndl {
 	off_t size;
 };
 
-
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
 
 
 static struct file_hndl *init_file_hndl(const char *filename)
@@ -1091,30 +1429,7 @@ static int client_wait_for_accept(int fd)
 	return connected_fd;
 }
 
-struct progress_ctx {
-	int reserved;
-};
-
-struct progress_ctx *init_progress_ctx(void)
-{
-	struct progress_ctx *ctx;
-
-	ctx = xzalloc(sizeof(*ctx));
-
-	return ctx;
-}
-
-void free_progress_ctx(struct progress_ctx *c)
-{
-	assert(c); free(c);
-}
-
-static void show_progress(struct progress_ctx *ctx, unsigned long rx_bytes)
-{
-	assert(ctx);
-}
-
-static int client_read_and_save_file(const struct srv_offer_info *sai, int fd)
+static int client_read_and_save_file(const struct ctx *ctx, const struct srv_offer_info *sai, int fd)
 {
 	int ret, buflen; // XXX: make this configurable
 	char *buf;
@@ -1122,11 +1437,16 @@ static int client_read_and_save_file(const struct srv_offer_info *sai, int fd)
 	unsigned long rx_calls = 0;
 	unsigned long rx_bytes = 0;
 	struct progress_ctx *progress_ctx;
+	int i = 0;
 
-	buflen = 2048;
+	/* allocate the rx buffer */
+	buflen = ctx->opts->rx_buf_size;
+	buf = xmalloc(buflen);
 
-	buf          = xmalloc(buflen);
-	progress_ctx = init_progress_ctx();
+	// calculate the number of objects based on the announced filesize
+	// and the buflen
+	progress = start_progress("receiving file", 100000);
+
 
 	while ((rc = read(fd, buf, buflen)) > 0) {
 		rx_bytes += rc;
@@ -1134,7 +1454,8 @@ static int client_read_and_save_file(const struct srv_offer_info *sai, int fd)
 			ret = write(STDOUT_FILENO, buf, rc);
 		} while (ret == -1 && errno == EINTR);
 
-		show_progress(progress_ctx, rx_bytes);
+		display_progress(progress, i++);
+		display_throughput(progress, rx_bytes);
 
 		if (ret != rc) {
 			err_sys("write failed");
@@ -1143,13 +1464,14 @@ static int client_read_and_save_file(const struct srv_offer_info *sai, int fd)
 	}
 
 	free(buf);
-	free_progress_ctx(progress_ctx);
+
+	stop_progress(&progress);
 
 	return SUCCESS;
 }
 
 
-static int client_rx_file(const struct srv_offer_info *sai, int fd)
+static int client_rx_file(const struct cxt *ctx, const struct srv_offer_info *sai, int fd)
 {
 	int connected_fd;
 
@@ -1157,7 +1479,7 @@ static int client_rx_file(const struct srv_offer_info *sai, int fd)
 	connected_fd = client_wait_for_accept(fd);
 
 	/* read the file from the new filedescriptor */
-	client_read_and_save_file(sai, connected_fd);
+	client_read_and_save_file(ctx, sai, connected_fd);
 
 	close(connected_fd);
 
@@ -1165,7 +1487,7 @@ static int client_rx_file(const struct srv_offer_info *sai, int fd)
 }
 
 
-static int cli_rx_file(const struct srv_offer_info *sai, int afd)
+static int cli_rx_file(struct ctx *ctx, const struct srv_offer_info *sai, int afd)
 {
 	uint16_t port;
 	int ret, fd;
@@ -1183,7 +1505,7 @@ static int cli_rx_file(const struct srv_offer_info *sai, int afd)
 	}
 
 	/* finaly receive the file */
-	ret = client_rx_file(sai, fd);
+	ret = client_rx_file(ctx, sai, fd);
 	if (ret != SUCCESS) {
 		err_msg_die(EXIT_FAILNET, "Can't receive the file, strange");
 	}
@@ -1200,10 +1522,10 @@ static int cli_rx_file(const struct srv_offer_info *sai, int afd)
  * wait for server file offer. If the server
  * offer a file the client opens a random TCP port,
  * send this port to the server and waits for the data */
-int client_mode(const struct opts *opts)
+int client_mode(const struct ctx *ctx)
 {
 	int pfd, afd, ret, must_block = 1;
-	const char *port = opts->port ?: DEFAULT_LISTEN_PORT;
+	const char *port = ctx->opts->port ?: DEFAULT_LISTEN_PORT;
 
 	pr_debug("netpp [client mode]");
 
@@ -1224,7 +1546,7 @@ int client_mode(const struct opts *opts)
 		 * now open a passice TCP socket, announce this
 		 * port to the server and wait for the file from
 		 * the server. That's all ;) */
-		ret = cli_rx_file(sai, afd);
+		ret = cli_rx_file(ctx, sai, afd);
 		if (ret == SUCCESS) {
 			pr_debug("file transfer completed, exiting now");
 			break;
@@ -1236,21 +1558,39 @@ int client_mode(const struct opts *opts)
 	return EXIT_SUCCESS;
 }
 
+struct ctx *init_ctx(void)
+{
+	struct ctx *ctx;
+
+	ctx = xzalloc(sizeof(*ctx));
+	ctx->opts = xzalloc(sizeof(*ctx->opts));
+
+	return ctx;
+}
+
+void free_ctx(struct ctx *c)
+{
+	free(c->opts); free(c);
+}
+
+#define	DEFAULT_RX_BUF_SIZE 4096
+
 
 int main(int ac, char **av)
 {
 	int c, ret, error;
-	struct opts *opts;
+	struct ctx *ctx;
 
 	ret = initiate_seed();
 	if (ret != SUCCESS)
 		err_msg_die(EXIT_FAILMISC, "Cannot initialize random seed");
 
-	opts = xzalloc(sizeof(*opts));
+	ctx = init_ctx();
 
 	/* opts defaults */
-	opts->wanted_af_family = PF_UNSPEC;
-	opts->me = xstrdup(av[0]);
+	ctx->opts->wanted_af_family = PF_UNSPEC;
+	ctx->opts->me = xstrdup(av[0]);
+	ctx->opts->rx_buf_size = DEFAULT_RX_BUF_SIZE;
 
 	while (1) {
 		int option_index = 0;
@@ -1262,23 +1602,28 @@ int main(int ac, char **av)
 			{0, 0, 0, 0}
 		};
 
-		c = getopt_long(ac, av, "p:h46",
+		c = getopt_long(ac, av, "b:p:h46",
 						long_options, &option_index);
 		if (c == -1)
 			break;
 
 		switch (c) {
 			case '4':
-				opts->wanted_af_family = PF_INET;
+				ctx->opts->wanted_af_family = PF_INET;
 				break;
 			case '6':
-				opts->wanted_af_family = PF_INET6;
+				ctx->opts->wanted_af_family = PF_INET6;
 				break;
 			case 'p':
-				opts->port = xstrdup(optarg);
+				ctx->opts->port = xstrdup(optarg);
+				break;
+			case 'b':
+				ctx->opts->rx_buf_size = xatoi(optarg);
+				if (ctx->opts->rx_buf_size < 1)
+					err_msg_die(EXIT_FAILOPT, "Buffer size should at least bigger then 0");
 				break;
 			case 'h':
-				usage(opts->me);
+				usage(ctx->opts->me);
 				error = EXIT_SUCCESS;
 				goto out_client;
 				break;
@@ -1294,23 +1639,22 @@ int main(int ac, char **av)
 
 	if (optind >= ac) {
 		/* FIXME: catch the case where more files are given */
-		error = client_mode(opts);
+		error = client_mode(ctx);
 		goto out_client;
 	}
 
-	opts->filename = xstrdup(av[optind]);
+	ctx->opts->filename = xstrdup(av[optind]);
 
-	error = server_mode(opts);
+	error = server_mode(ctx->opts);
 	goto out_server;
 
 out_server:
-	free(opts->filename);
+	free(ctx->opts->filename);
 out_client:
-	if (opts->port)
-		free(opts->port);
-	free(opts->me);
-	free(opts);
+	if (ctx->opts->port)
+		free(ctx->opts->port);
+	free(ctx->opts->me);
 	return error;
 }
 
-/* vim: set tw=78 ts=8 sw=8 sts=8 ff=unix noet: */
+/* vim: set tw=78 ts=4 sw=4 sts=4 ff=unix noet: */
