@@ -196,6 +196,11 @@ int subtime(struct timeval *op1, struct timeval *op2,
 	return sign;
 }
 
+static double tv_to_sec(struct timeval *tv)
+{
+	return (double)tv->tv_sec + (double)tv->tv_usec * 1000000;
+}
+
 
 void msg(const char *format, ...)
 {
@@ -1078,25 +1083,49 @@ static int client_wait_for_accept(int fd)
 	return connected_fd;
 }
 
+struct progress_ctx {
+};
+
+struct progress_ctx *init_progress_ctx(void)
+{
+	struct progress_ctx *ctx;
+
+	ctx = xzalloc(*ctx);
+
+	return ctx;
+}
+
+void free_progress_ctx(struct progress_ctx *c)
+{
+	assert(c); free(c);
+}
+
+static void show_progress(struct progress_ctx *ctx, unsigned long rx_bytes)
+{
+	assert(ctx);
+}
+
 static int client_read_and_save_file(const struct srv_offer_info *sai, int fd)
 {
-	int buflen; // XXX: make this configurable
+	int ret, buflen; // XXX: make this configurable
 	char *buf;
 	ssize_t rc;
 	unsigned long rx_calls = 0;
 	unsigned long rx_bytes = 0;
+	struct progress_ctx *progress_ctx;
 
 	buflen = 2048;
 
-	buf = xmalloc(buflen);
+	buf          = xmalloc(buflen);
+	progress_ctx = init_progress_ctx();
 
 	while ((rc = read(fd, buf, buflen)) > 0) {
-		ssize_t ret;
-		rx_calls++;
 		rx_bytes += rc;
 		do {
 			ret = write(STDOUT_FILENO, buf, rc);
 		} while (ret == -1 && errno == EINTR);
+
+		show_progress(rx_bytes);
 
 		if (ret != rc) {
 			err_sys("write failed");
@@ -1105,6 +1134,7 @@ static int client_read_and_save_file(const struct srv_offer_info *sai, int fd)
 	}
 
 	free(buf);
+	free_progress_ctx(progress_ctx);
 
 	return SUCCESS;
 }
@@ -1114,8 +1144,10 @@ static int client_rx_file(const struct srv_offer_info *sai, int fd)
 {
 	int connected_fd;
 
+	/* block until the server connect to our socket */
 	connected_fd = client_wait_for_accept(fd);
 
+	/* read the file from the new filedescriptor */
 	client_read_and_save_file(sai, connected_fd);
 
 	close(connected_fd);
