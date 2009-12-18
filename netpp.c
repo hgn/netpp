@@ -131,7 +131,7 @@
 
 #define MAXERRMSG 1024
 
-#define	LISTENADDRESS "224.110.99.112"
+#define	DEFAULT_V4_MULT_ADDR "224.110.99.112"
 #define DEFAULT_LISTEN_PORT "6666"
 
 struct opts {
@@ -219,7 +219,7 @@ void msg(const char *format, ...)
 
 
 static void err_doit(int sys_error, const char *file,
-					 const int line_no, const char *fmt, va_list ap)
+		const int line_no, const char *fmt, va_list ap)
 {
 	int errno_save;
 	char buf[MAXERRMSG];
@@ -229,7 +229,8 @@ static void err_doit(int sys_error, const char *file,
 	vsnprintf(buf, sizeof(buf) - 1, fmt, ap);
 	if (sys_error) {
 		size_t len = strlen(buf);
-		snprintf(buf + len,  sizeof buf - len, " (%s)", strerror(errno_save));
+		snprintf(buf + len,  sizeof buf - len, " (%s)",
+				strerror(errno_save));
 	}
 
 	fprintf(stderr, "ERROR [%s:%d]: %s\n", file, line_no, buf);
@@ -252,7 +253,7 @@ void x_err_ret(const char *file, int line_no, const char *fmt, ...)
 
 void x_err_sys(const char *file, int line_no, const char *fmt, ...)
 {
-	va_list         ap;
+	va_list ap;
 
 	va_start(ap, fmt);
 	err_doit(1, file, line_no, fmt, ap);
@@ -264,7 +265,7 @@ static void * xmalloc(size_t size)
 {
 	void *ptr = malloc(size);
 	if (!ptr)
-		err_msg_die(EXIT_FAILMEM, "Out of mem: %s!\n", strerror(errno));
+		err_sys_die(EXIT_FAILMEM, "failure in malloc!\n");
 	return ptr;
 }
 
@@ -278,7 +279,7 @@ static void* xzalloc(size_t size)
 
 
 static void xsetsockopt(int s, int level, int optname,
-						const void *optval, socklen_t optlen, const char *str)
+		const void *optval, socklen_t optlen, const char *str)
 {
 	int ret = setsockopt(s, level, optname, optval, optlen);
 	if (ret)
@@ -303,7 +304,7 @@ static int initiate_seed(void)
 	rand_fd = open(RANDPOOLSRC, O_RDONLY);
 	if (rand_fd < 0)
 		err_sys_die(EXIT_FAILINT,
-					"Cannot open random pool file %s", RANDPOOLSRC);
+				"Cannot open random pool file %s", RANDPOOLSRC);
 
 	ret = read(rand_fd, &randpool, sizeof(unsigned int));
 	if (ret != sizeof(unsigned int)) {
@@ -344,7 +345,7 @@ static void xgetnameinfo(const struct sockaddr *sa, socklen_t salen,
 	ret = getnameinfo(sa, salen, host, hostlen, serv, servlen, flags);
 	if (unlikely((ret != 0))) {
 		err_msg_die(EXIT_FAILNET, "Call to getnameinfo() failed: %s!\n",
-				(ret == EAI_SYSTEM) ?  strerror(errno) : gai_strerror(ret));
+				(ret == EAI_SYSTEM) ? strerror(errno) : gai_strerror(ret));
 
 	}
 }
@@ -361,13 +362,17 @@ static void enable_multicast_v4(int fd, const struct addrinfo *a)
 	struct ip_mreq mreq;
 
 	memset(&mreq, 0, sizeof(struct ip_mreq));
-	memcpy(&mreq.imr_multiaddr, &(((struct sockaddr_in *)a->ai_addr)->sin_addr), sizeof(struct in_addr));
+	memcpy(&mreq.imr_multiaddr,
+			&(((struct sockaddr_in *)a->ai_addr)->sin_addr),
+			sizeof(struct in_addr));
 	mreq.imr_interface.s_addr = INADDR_ANY;
 
-	xsetsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &on, sizeof(int), "IP_MULTICAST_LOOP");
+	xsetsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &on,
+			sizeof(int), "IP_MULTICAST_LOOP");
 	pr_debug("set IP_MULTICAST_LOOP option");
 
-	xsetsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(struct ip_mreq), "IP_ADD_MEMBERSHIP");
+	xsetsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq,
+			sizeof(struct ip_mreq), "IP_ADD_MEMBERSHIP");
 	pr_debug("add membership to IPv4 multicast group");
 }
 
@@ -379,7 +384,9 @@ static void enable_multicast_v6(int fd, const struct addrinfo *a)
 
 	memset(&mreq6, 0, sizeof(struct ipv6_mreq));
 
-	memcpy(&mreq6.ipv6mr_multiaddr, &(((struct sockaddr_in6 *)a->ai_addr)->sin6_addr), sizeof(struct in6_addr));
+	memcpy(&mreq6.ipv6mr_multiaddr,
+			&(((struct sockaddr_in6 *)a->ai_addr)->sin6_addr),
+			sizeof(struct in6_addr));
 	mreq6.ipv6mr_interface = 0; /* FIXME: determine interface */
 
 	xsetsockopt(fd, IPPROTO_IPV6, IPV6_MULTICAST_LOOP,
@@ -461,8 +468,8 @@ int init_passive_socket(const char *addr, const char *port, int must_block)
 	for (addrtmp = hostres; addrtmp != NULL ; addrtmp = addrtmp->ai_next) {
 
 		xgetnameinfo(addrtmp->ai_addr, addrtmp->ai_addrlen,
-						addr_name, sizeof(addr_name), NULL, 0,
-						NI_NUMERICHOST | NI_NUMERICSERV);
+				addr_name, sizeof(addr_name), NULL, 0,
+				NI_NUMERICHOST | NI_NUMERICSERV);
 
 		pr_debug("try to open a passive socket with multicast address %s",
 				 addr_name);
@@ -520,7 +527,8 @@ static struct file_hndl *init_file_hndl(const char *filename)
 	pr_debug("serving file %s of size %u byte", filename, file_hndl->size);
 
 	if (!S_ISREG(statb.st_mode)) {
-		err_msg_die(EXIT_FAILFILE, "File %s is no regular file, giving up!", filename);
+		err_msg_die(EXIT_FAILFILE,
+				"File %s is no regular file, giving up!", filename);
 	}
 
 	return file_hndl;
@@ -900,8 +908,8 @@ int server_mode(const struct opts *opts)
 
 	file_hndl = init_file_hndl(opts->filename);
 
-	pfd = init_passive_socket(LISTENADDRESS, port, must_block);
-	afd = init_active_socket(LISTENADDRESS, port);
+	pfd = init_passive_socket(DEFAULT_V4_MULT_ADDR, port, must_block);
+	afd = init_active_socket(DEFAULT_V4_MULT_ADDR, port);
 
 
 	while (23) {
@@ -1084,13 +1092,14 @@ static int client_wait_for_accept(int fd)
 }
 
 struct progress_ctx {
+	int reserved;
 };
 
 struct progress_ctx *init_progress_ctx(void)
 {
 	struct progress_ctx *ctx;
 
-	ctx = xzalloc(*ctx);
+	ctx = xzalloc(sizeof(*ctx));
 
 	return ctx;
 }
@@ -1125,7 +1134,7 @@ static int client_read_and_save_file(const struct srv_offer_info *sai, int fd)
 			ret = write(STDOUT_FILENO, buf, rc);
 		} while (ret == -1 && errno == EINTR);
 
-		show_progress(rx_bytes);
+		show_progress(progress_ctx, rx_bytes);
 
 		if (ret != rc) {
 			err_sys("write failed");
@@ -1198,8 +1207,8 @@ int client_mode(const struct opts *opts)
 
 	pr_debug("netpp [client mode]");
 
-	pfd = init_passive_socket(LISTENADDRESS, port, must_block);
-	afd = init_active_socket(LISTENADDRESS, port);
+	pfd = init_passive_socket(DEFAULT_V4_MULT_ADDR, port, must_block);
+	afd = init_active_socket(DEFAULT_V4_MULT_ADDR, port);
 
 	while (23) {
 		struct srv_offer_info *sai; /* XXX: free this */
