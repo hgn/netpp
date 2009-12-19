@@ -968,9 +968,6 @@ static int init_active_socket(const char *addr, const char *port)
 
 	freeaddrinfo(res0);
 
-	/* XXX: is this required here */
-	set_non_blocking(sock);
-
 	return sock;
 }
 
@@ -1282,30 +1279,30 @@ static void cl_print_srv_offer(const struct ctx *ctx)
 {
 	char peer[1024], portstr[8];
 	uint32_t filesize = ctx->cl_offer_info.file_size;
-	const char *prefix; int div; double pretty_filesize;
+	const char *prefix; int divisor; double pretty_filesize;
 
 	if (filesize > 1024 * 1024 * 1024) {
-		prefix = "GiB";
-		div    = 1024 * 1024 * 1024;
+		prefix  = "GiB";
+		divisor = 1024 * 1024 * 1024;
 	} else if (filesize > 1024 * 1024) {
-		prefix = "MiB";
-		div    = 1024 * 1024;
+		prefix  = "MiB";
+		divisor = 1024 * 1024;
 	} else if (filesize > 1024) {
-		prefix = "KiB";
-		div    = 1024;
+		prefix  = "KiB";
+		divisor = 1024;
 	} else {
-		prefix = "";
-		div    = 1;
+		prefix  = "";
+		divisor = 1;
 	}
 
-	pretty_filesize = (double)filesize / div;
+	pretty_filesize = (double)filesize / divisor;
 
 	xgetnameinfo((struct sockaddr *)&ctx->cl_srv_addr_info.ss,
 			ctx->cl_srv_addr_info.ss_len, peer,
 			sizeof(peer), portstr, sizeof(portstr),
 			NI_NUMERICSERV | NI_NUMERICHOST);
 
-	fprintf(stdout, "host %s provided a offer for file \"%s\" of size %.2lf %s\n",
+	fprintf(stdout, "host %s provide a offer for file \"%s\" of size %.2lf %s\n",
 			peer, ctx->cl_offer_info.filename, pretty_filesize, prefix);
 }
 
@@ -1434,7 +1431,6 @@ static int client_inform_server(const struct ctx *ctx, int afd, uint16_t port)
 
 static int client_wait_for_accept(int fd)
 {
-	int ret;
 	struct sockaddr_storage sa;
 	socklen_t sa_len = sizeof(sa);
 	char peer[1024], portstr[8];
