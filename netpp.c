@@ -160,6 +160,8 @@ static const int debug_enabled = 0;
 
 #define MAXERRMSG 1024
 
+#define	DEFAULT_RX_BUF_SIZE 2048
+
 #define	DEFAULT_V4_MULT_ADDR "224.110.99.112"
 #define DEFAULT_LISTEN_PORT "6666"
 
@@ -190,19 +192,52 @@ struct offer_pdu_tlv_file {
 	uint16_t len;
 	uint32_t filesize;
 	uint32_t filename_len;
-	char filename[0]; /* must end on a 4 byte boundary */
+	char filename[FLEX_ARRAY]; /* must end on a 4 byte boundary */
 } __attribute__((packed));
 
 /* this message is sent from the client to the
  * server and signals that the client received
- * correctly a offer pdu, opens a passive TCP socket
+ * correctly a offer PDU, opens a passive TCP socket
  * on port port and is now ready to receive the file */
 struct request_pdu_hdr {
 	uint16_t port;
 } __attribute__((packed));
 
+struct cl_offer_info {
+	uint32_t file_size;
+	uint32_t filename_len;
+	char *filename;
+};
+
+struct cl_srv_addr_info {
+	struct sockaddr_storage ss;
+	ssize_t ss_len;
+};
+
+struct srv_cl_request_info {
+	uint16_t port;
+};
+
+struct srv_cl_addr_info {
+	struct sockaddr_storage ss;
+	ssize_t ss_len;
+};
+
+struct srv_file_hndl {
+	int fd;
+	char *name;
+	off_t filesize;
+};
+
 struct ctx {
 	struct opts *opts;
+	/* client bookkeeping */
+	struct cl_offer_info cl_offer_info;
+	struct cl_srv_addr_info cl_srv_addr_info;
+	/* server stuff */
+	struct srv_cl_request_info srv_cl_request_info;
+	struct srv_cl_addr_info srv_cl_addr_info;
+	struct srv_file_hndl srv_file_hndl;
 };
 
 int subtime(struct timeval *op1, struct timeval *op2,
@@ -357,15 +392,11 @@ static int xatoi(const char *str)
 	if (endptr == str)
 		err_msg_die(EXIT_FAILURE, "No digits found in commandline");
 
-	if (val > INT_MAX) {
-		err_msg("xatoi: value %ld to large to fit into a integer "
-				"- process with INT_MAX!", val);
+	if (val > INT_MAX)
 		return INT_MAX;
-	} else if (val < INT_MIN) {
-		err_msg("xatoi: value %ld to small to fit into a integer "
-				"- process with INT_MIN!", val);
+
+	if (val < INT_MIN)
 		return INT_MIN;
-	}
 
 	if ('\0' != *endptr)
 		err_msg_die(EXIT_FAILURE,
@@ -430,9 +461,13 @@ static void set_progress_signal(void)
 
 static void clear_progress_signal(void)
 {
-	struct itimerval v = {{0,},};
+	struct itimerval v;
+
+	memset(&v, 0, sizeof(v));
+
 	setitimer(ITIMER_REAL, &v, NULL);
 	signal(SIGALRM, SIG_IGN);
+
 	progress_update = 0;
 }
 
@@ -845,37 +880,36 @@ struct file_hndl {
 
 
 
-static struct file_hndl *init_file_hndl(const char *filename)
+static int init_file_hndl(struct ctx *ctx)
 {
 	int ret;
 	struct file_hndl *file_hndl;
 	struct stat statb;
 
-	file_hndl = xzalloc(sizeof(*file_hndl));
+	ctx->srv_file_hndl.name = ctx->opts->filename;
+	ctx->srv_file_hndl.fd = open(ctx->srv_file_hndl.name, O_RDONLY);
+	if (ctx->srv_file_hndl.fd < 0)
+		err_sys_die(EXIT_FAILFILE, "Cannot open the file %s!",
+				ctx->srv_file_hndl.name);
 
-	file_hndl->name = filename;
-
-	ret = stat(filename, &statb);
+	ret = fstat(ctx->srv_file_hndl.fd, &statb);
 	if (ret < 0) {
-		err_sys_die(EXIT_FAILFILE, "Cannot open file %s!", filename);
+		err_sys_die(EXIT_FAILFILE, "Cannot open file %s!",
+				ctx->srv_file_hndl.name);
 	}
 
-	file_hndl->size = statb.st_size;
+	ctx->srv_file_hndl.filesize = statb.st_size;
 
-	pr_debug("serving file %s of size %u byte", filename, file_hndl->size);
+	pr_debug("serving file %s of size %u byte",
+			ctx->srv_file_hndl.name, ctx->srv_file_hndl.filesize);
 
 	if (!S_ISREG(statb.st_mode)) {
 		err_msg_die(EXIT_FAILFILE,
-				"File %s is no regular file, giving up!", filename);
+				"File %s is no regular file, giving up!",
+				ctx->srv_file_hndl.name);
 	}
 
-	return file_hndl;
-}
-
-
-static void free_file_hndl(struct file_hndl *file_hndl)
-{
-	free(file_hndl);
+	return SUCCESS;
 }
 
 
@@ -950,36 +984,33 @@ static char *xstrdup(const char *s)
 #define	TLV_READ2(p, n) do { n = *(int16_t *)p; TLV_SKIP2(p); } while (0)
 #define	TLV_READ4(p, n) do { n = *(int32_t *)p; TLV_SKIP4(p); } while (0)
 
-static int decode_offer_pdu(char *pdu, size_t pdu_len, struct srv_offer_data **sad)
+static int decode_offer_pdu(struct ctx *ctx, char *pdu, size_t pdu_len)
 {
+	uint32_t tmp;
 	char *ptr = pdu;
-	struct srv_offer_data *sadt;
+	struct cl_offer_info *cl_offer_info = &ctx->cl_offer_info;
 
 	if (pdu_len < 4 + 4 + 1) {
 		pr_debug("offered file should be at least one character in name");
 		return FAILURE;
 	}
 
-	sadt = xzalloc(sizeof(*sadt));
+	TLV_READ4(ptr, tmp);
+	cl_offer_info->file_size = ntohl(tmp);
 
-	TLV_READ4(ptr, sadt->size);
-	sadt->size = ntohl(sadt->size);
+	TLV_READ4(ptr, tmp);
+	cl_offer_info->filename_len = ntohl(tmp);
 
-	TLV_READ4(ptr, sadt->filename_len);
-	sadt->filename_len = ntohl(sadt->filename_len);
-
-	if (pdu_len < 4 + 4 + sadt->filename_len) {
+	if (pdu_len < 4 + 4 + cl_offer_info->filename_len) {
 		pr_debug("offered filename is %u bytes but transmitted only %u",
-				  sadt->filename_len, pdu_len - 4 - 4);
-		free(sadt);
+				  cl_offer_info->filename_len, pdu_len - 4 - 4);
 		return FAILURE;
 	}
 
-	pr_debug("offered file \"%s\", filesize: %u bytes", ptr, sadt->size);
+	pr_debug("offered file \"%s\", filesize: %u bytes",
+			ptr, cl_offer_info->file_size);
 
-	sadt->name = xstrdup(ptr);
-
-	*sad = sadt;
+	cl_offer_info->filename = xstrdup(ptr);
 
 	return SUCCESS;
 }
@@ -992,28 +1023,28 @@ static void free_srv_offer_data(struct srv_offer_data *s)
 }
 
 
-static size_t encode_offer_pdu(unsigned char *pdu,
-		size_t max_pdu_len, const struct file_hndl *file_hndl)
+static size_t encode_offer_pdu(struct ctx *ctx, unsigned char *pdu, size_t max_pdu_len)
 {
 	unsigned char *ptr = pdu;
 	size_t len = 0;
+	const char *filename = ctx->srv_file_hndl.name;
 
 
-	TLV_WRITE4(ptr, htonl(file_hndl->size));
+	TLV_WRITE4(ptr, htonl(ctx->srv_file_hndl.filesize));
 	len += 4;
 
-	TLV_WRITE4(ptr, htonl(strlen(file_hndl->name) + 1));
+	TLV_WRITE4(ptr, htonl(strlen(filename) + 1));
 	len += 4;
 
-	if (strlen(file_hndl->name) + 1 >= max_pdu_len - len) {
+	if (strlen(filename) + 1 >= max_pdu_len - len) {
 		err_msg_die(EXIT_FAILINT, "remaining buffer (%d byte) to small to "
 				"transmit filename (%d byte)!",
-				max_pdu_len - len, strlen(file_hndl->name));
+				max_pdu_len - len, strlen(filename));
 	}
 
-	memcpy(ptr, file_hndl->name, strlen(file_hndl->name) + 1);
+	memcpy(ptr, filename, strlen(filename) + 1);
 
-	len += strlen(file_hndl->name) + 1;
+	len += strlen(filename) + 1;
 
 	return len;
 }
@@ -1021,14 +1052,14 @@ static size_t encode_offer_pdu(unsigned char *pdu,
 
 #define	OFFER_PDU_LEN_MAX 512
 
-static int srv_tx_offer_pdu(int fd, const struct file_hndl *file_hndl)
+static int srv_tx_offer_pdu(struct ctx *ctx, int fd)
 {
 	ssize_t ret; size_t len;
 	unsigned char buf[OFFER_PDU_LEN_MAX];
 
 	memset(buf, 0, sizeof(buf));
 
-	len = encode_offer_pdu(buf, OFFER_PDU_LEN_MAX, file_hndl);
+	len = encode_offer_pdu(ctx, buf, OFFER_PDU_LEN_MAX);
 
 	ret = write(fd, buf, len);
 	if (ret == -1 && !(errno == EWOULDBLOCK)) {
@@ -1234,25 +1265,29 @@ static void srv_tx_file(const struct client_request_info *cri, const char *file)
  * If a client want to receive this data the client opens
  * a TCP socket and inform the server that he want this file,
  * we push this file to the server */
-int server_mode(const struct opts *opts)
+int server_mode(struct ctx *ctx)
 {
 	int pfd, afd, ret;
 	struct client_request_info *client_request_info;
 	struct file_hndl *file_hndl;
 	int must_block = 0;
-	const char *port = opts->port ?: DEFAULT_LISTEN_PORT;
+	const char *port, *filename;
 
-	pr_debug("netpp [server mode, serving file %s]", opts->filename);
+	port = ctx->opts->port ?: DEFAULT_LISTEN_PORT;
+	filename = ctx->opts->filename;
 
-	file_hndl = init_file_hndl(opts->filename);
+	pr_debug("netpp [server mode, serving file %s]", filename);
+
+	ret = init_file_hndl(ctx);
+	if (ret != SUCCESS)
+		err_msg_die(EXIT_FAILFILE, "Cannot open and setup the file");
 
 	pfd = init_passive_socket(DEFAULT_V4_MULT_ADDR, port, must_block);
 	afd = init_active_socket(DEFAULT_V4_MULT_ADDR, port);
 
-
 	while (23) {
 
-		ret = srv_tx_offer_pdu(afd, file_hndl);
+		ret = srv_tx_offer_pdu(ctx, afd);
 		if (ret != SUCCESS) {
 			err_msg_die(EXIT_FAILNET, "Failure in offer broadcast");
 		}
@@ -1262,7 +1297,7 @@ int server_mode(const struct opts *opts)
 			if (ret != SUCCESS)
 				break;
 
-			srv_tx_file(client_request_info, opts->filename);
+			srv_tx_file(client_request_info, filename);
 
 			free_client_request_info(client_request_info);
 		}
@@ -1270,7 +1305,8 @@ int server_mode(const struct opts *opts)
 		sleep(1);
 	}
 
-	free_file_hndl(file_hndl);
+	close(ctx->srv_file_hndl.fd);
+	close(afd);
 	close(pfd);
 
 	return EXIT_SUCCESS;
@@ -1284,30 +1320,27 @@ struct srv_offer_info {
 };
 
 
-static int client_try_read_offer_pdu(int pfd, struct srv_offer_info **crl)
+static int client_try_read_offer_pdu(struct ctx *ctx, int pfd)
 {
 	ssize_t ret;
 	char rx_buf[RX_BUF];
-	struct sockaddr_storage ss;
-	socklen_t ss_len = sizeof(ss);
 	struct srv_offer_data *sad;
 
-	(void) crl;
+	ctx->cl_srv_addr_info.ss_len = sizeof(ctx->cl_srv_addr_info.ss);
 
-	ret = recvfrom(pfd, rx_buf, RX_BUF, 0, (struct sockaddr *)&ss, &ss_len);
+	ret = recvfrom(pfd, rx_buf, RX_BUF, 0,
+			(struct sockaddr *)&ctx->cl_srv_addr_info.ss, &ctx->cl_srv_addr_info.ss_len);
 	if (ret < 0) {
 		err_sys_die(EXIT_FAILNET, "failed to read()");
 	}
 
 	pr_debug("received %u byte from server", ret);
 
-	ret = decode_offer_pdu(rx_buf, ret, &sad);
+	ret = decode_offer_pdu(ctx, rx_buf, ret);
 	if (ret != SUCCESS) {
 		pr_debug("server offer pdu does not match our exception, igoring it");
 		return FAILURE;
 	}
-
-	free_srv_offer_data(sad);
 
 	return SUCCESS;
 }
@@ -1388,7 +1421,7 @@ static int client_open_stream_sink(uint16_t *port, int *lfd)
 }
 
 
-static int client_inform_server(const struct srv_offer_info *sai, int afd, uint16_t port)
+static int client_inform_server(const struct ctx *ctx, int afd, uint16_t port)
 {
 	ssize_t ret;
 	struct request_pdu_hdr request_pdu_hdr;
@@ -1397,7 +1430,7 @@ static int client_inform_server(const struct srv_offer_info *sai, int afd, uint1
 
 	request_pdu_hdr.port = htons(port);
 
-	/* send a mesage to sai */
+	/* send a message to ctx->cl_srv_addr_info.ss */
 	ret = write(afd, &request_pdu_hdr, sizeof(request_pdu_hdr));
 	if (ret == -1 && !(errno == EWOULDBLOCK)) {
 		err_sys_die(EXIT_FAILNET, "Cannot send offer message");
@@ -1429,24 +1462,26 @@ static int client_wait_for_accept(int fd)
 	return connected_fd;
 }
 
-static int client_read_and_save_file(const struct ctx *ctx, const struct srv_offer_info *sai, int fd)
+static int client_read_and_save_file(struct ctx *ctx, int fd)
 {
-	int ret, buflen; // XXX: make this configurable
+	int ret, buflen;
 	char *buf;
 	ssize_t rc;
-	unsigned long rx_calls = 0;
-	unsigned long rx_bytes = 0;
+	unsigned long rx_calls, rx_bytes, chunks;
 	struct progress_ctx *progress_ctx;
-	int i = 0;
+	int i = 1;
 
-	/* allocate the rx buffer */
+	rx_calls = rx_bytes = 0;
+
+	/* allocate the RX buffer */
 	buflen = ctx->opts->rx_buf_size;
-	buf = xmalloc(buflen);
+	buf = xmalloc(ctx->opts->rx_buf_size);
 
-	// calculate the number of objects based on the announced filesize
-	// and the buflen
-	progress = start_progress("receiving file", 100000);
+	/* calculate the number of objects based on the announced
+	 * file size and the actual RX buffer size */
+	chunks = ctx->cl_offer_info.file_size / buflen;
 
+	progress = start_progress("receiving file", chunks);
 
 	while ((rc = read(fd, buf, buflen)) > 0) {
 		rx_bytes += rc;
@@ -1471,7 +1506,7 @@ static int client_read_and_save_file(const struct ctx *ctx, const struct srv_off
 }
 
 
-static int client_rx_file(const struct cxt *ctx, const struct srv_offer_info *sai, int fd)
+static int client_rx_file(struct ctx *ctx, int fd)
 {
 	int connected_fd;
 
@@ -1479,7 +1514,7 @@ static int client_rx_file(const struct cxt *ctx, const struct srv_offer_info *sa
 	connected_fd = client_wait_for_accept(fd);
 
 	/* read the file from the new filedescriptor */
-	client_read_and_save_file(ctx, sai, connected_fd);
+	client_read_and_save_file(ctx, connected_fd);
 
 	close(connected_fd);
 
@@ -1487,7 +1522,7 @@ static int client_rx_file(const struct cxt *ctx, const struct srv_offer_info *sa
 }
 
 
-static int cli_rx_file(struct ctx *ctx, const struct srv_offer_info *sai, int afd)
+static int cli_rx_file(struct ctx *ctx, int afd)
 {
 	uint16_t port;
 	int ret, fd;
@@ -1499,13 +1534,13 @@ static int cli_rx_file(struct ctx *ctx, const struct srv_offer_info *sai, int af
 	}
 
 	/* inform the server about the newly created connection */
-	ret = client_inform_server(sai, afd, port);
+	ret = client_inform_server(ctx, afd, port);
 	if (ret != SUCCESS) {
 		err_msg_die(EXIT_FAILNET, "Can't inform the server, upps!");
 	}
 
-	/* finaly receive the file */
-	ret = client_rx_file(ctx, sai, fd);
+	/* finally receive the file */
+	ret = client_rx_file(ctx, fd);
 	if (ret != SUCCESS) {
 		err_msg_die(EXIT_FAILNET, "Can't receive the file, strange");
 	}
@@ -1522,7 +1557,7 @@ static int cli_rx_file(struct ctx *ctx, const struct srv_offer_info *sai, int af
  * wait for server file offer. If the server
  * offer a file the client opens a random TCP port,
  * send this port to the server and waits for the data */
-int client_mode(const struct ctx *ctx)
+int client_mode(struct ctx *ctx)
 {
 	int pfd, afd, ret, must_block = 1;
 	const char *port = ctx->opts->port ?: DEFAULT_LISTEN_PORT;
@@ -1533,12 +1568,10 @@ int client_mode(const struct ctx *ctx)
 	afd = init_active_socket(DEFAULT_V4_MULT_ADDR, port);
 
 	while (23) {
-		struct srv_offer_info *sai; /* XXX: free this */
-
 		pr_debug("wait to receive a valid offer message from a server");
 
 		/* block until we receive a offer pdu */
-		ret = client_try_read_offer_pdu(pfd, &sai);
+		ret = client_try_read_offer_pdu(ctx, pfd);
 		if (ret != SUCCESS)
 			continue;
 
@@ -1546,7 +1579,7 @@ int client_mode(const struct ctx *ctx)
 		 * now open a passice TCP socket, announce this
 		 * port to the server and wait for the file from
 		 * the server. That's all ;) */
-		ret = cli_rx_file(ctx, sai, afd);
+		ret = cli_rx_file(ctx, afd);
 		if (ret == SUCCESS) {
 			pr_debug("file transfer completed, exiting now");
 			break;
@@ -1570,10 +1603,11 @@ struct ctx *init_ctx(void)
 
 void free_ctx(struct ctx *c)
 {
+	if (c->cl_offer_info.filename)
+		free(c->cl_offer_info.filename);
+
 	free(c->opts); free(c);
 }
-
-#define	DEFAULT_RX_BUF_SIZE 4096
 
 
 int main(int ac, char **av)
@@ -1645,7 +1679,7 @@ int main(int ac, char **av)
 
 	ctx->opts->filename = xstrdup(av[optind]);
 
-	error = server_mode(ctx->opts);
+	error = server_mode(ctx);
 	goto out_server;
 
 out_server:

@@ -22,7 +22,7 @@ ifdef EPOLL
 endif
 
 ifdef DEBUG_BUILD
-	#EXTRA_CFLAGS += -DDEBUG
+	EXTRA_CFLAGS += -DDEBUG
 endif
 
 .SUFFIXES:
