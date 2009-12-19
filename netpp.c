@@ -165,12 +165,18 @@ static const int debug_enabled = 0;
 #define	DEFAULT_V4_MULT_ADDR "224.110.99.112"
 #define DEFAULT_LISTEN_PORT "6666"
 
+enum {
+	MODE_SERVER = 1,
+	MODE_CLIENT
+};
+
 struct opts {
 	int wanted_af_family;
 	int rx_buf_size;
 	char *me;
 	char *port;
 	char *filename;
+	char *outfilename;
 };
 
 #define	OFFER_PDU_MAGIC 0x2323
@@ -214,6 +220,10 @@ struct cl_srv_addr_info {
 	socklen_t ss_len;
 };
 
+struct cl_file_hndl {
+	int fd;
+};
+
 struct srv_cl_request_info {
 	uint16_t port;
 };
@@ -225,15 +235,17 @@ struct srv_cl_addr_info {
 
 struct srv_file_hndl {
 	int fd;
-	char *name;
+	char *name; /* pointer to opts.filename */
 	off_t filesize;
 };
 
 struct ctx {
+	int mode;
 	struct opts *opts;
 	/* client bookkeeping */
 	struct cl_offer_info cl_offer_info;
 	struct cl_srv_addr_info cl_srv_addr_info;
+	struct cl_file_hndl cl_file_hndl;
 	/* server stuff */
 	struct srv_cl_request_info srv_cl_request_info;
 	struct srv_cl_addr_info srv_cl_addr_info;
@@ -729,7 +741,7 @@ static void xgetnameinfo(const struct sockaddr *sa, socklen_t salen,
 
 static void usage(const char *me)
 {
-	fprintf(stdout, "%s (-4|-6) (-b <rx-buffer-size>) (-p <port>) [filename]\n", me);
+	fprintf(stdout, "%s (-4|-6) (-b <rx-buffer-size>) (-p <port>) (-o <output-filename>) [filename]\n", me);
 }
 
 
@@ -1266,6 +1278,37 @@ int server_mode(struct ctx *ctx)
 	return EXIT_SUCCESS;
 }
 
+static void cl_print_srv_offer(const struct ctx *ctx)
+{
+	char peer[1024], portstr[8];
+	uint32_t filesize = ctx->cl_offer_info.file_size;
+	const char *prefix; int div; double pretty_filesize;
+
+	if (filesize > 1024 * 1024 * 1024) {
+		prefix = "GiB";
+		div    = 1024 * 1024 * 1024;
+	} else if (filesize > 1024 * 1024) {
+		prefix = "MiB";
+		div    = 1024 * 1024;
+	} else if (filesize > 1024) {
+		prefix = "KiB";
+		div    = 1024;
+	} else {
+		prefix = "";
+		div    = 1;
+	}
+
+	pretty_filesize = (double)filesize / div;
+
+	xgetnameinfo((struct sockaddr *)&ctx->cl_srv_addr_info.ss,
+			ctx->cl_srv_addr_info.ss_len, peer,
+			sizeof(peer), portstr, sizeof(portstr),
+			NI_NUMERICSERV | NI_NUMERICHOST);
+
+	fprintf(stdout, "host %s provided a offer for file \"%s\" of size %.2lf %s\n",
+			peer, ctx->cl_offer_info.filename, pretty_filesize, prefix);
+}
+
 
 static int client_try_read_offer_pdu(struct ctx *ctx, int pfd)
 {
@@ -1287,6 +1330,8 @@ static int client_try_read_offer_pdu(struct ctx *ctx, int pfd)
 		pr_debug("server offer pdu does not match our exception, igoring it");
 		return FAILURE;
 	}
+
+	cl_print_srv_offer(ctx);
 
 	return SUCCESS;
 }
@@ -1399,10 +1444,8 @@ static int client_wait_for_accept(int fd)
 	if (connected_fd == -1)
 		err_sys_die(EXIT_FAILNET, "accept");
 
-	ret = getnameinfo((struct sockaddr *)&sa, sa_len, peer,
+	xgetnameinfo((struct sockaddr *)&sa, sa_len, peer,
 			sizeof(peer), portstr, sizeof(portstr), NI_NUMERICSERV|NI_NUMERICHOST);
-	if (ret != 0)
-		err_msg("getnameinfo error: %s",  gai_strerror(ret));
 
 
 	pr_debug("accept connection from host %s via remote port %s", peer, portstr);
@@ -1433,7 +1476,7 @@ static int client_read_and_save_file(struct ctx *ctx, int fd)
 	while ((rc = read(fd, buf, buflen)) > 0) {
 		rx_bytes += rc;
 		do {
-			ret = write(STDOUT_FILENO, buf, rc);
+			ret = write(ctx->cl_file_hndl.fd, buf, rc);
 		} while (ret == -1 && errno == EINTR);
 
 		display_progress(progress, i++);
@@ -1445,9 +1488,11 @@ static int client_read_and_save_file(struct ctx *ctx, int fd)
 		}
 	}
 
-	free(buf);
-
 	stop_progress(&progress);
+
+	close(ctx->cl_file_hndl.fd);
+
+	free(buf);
 
 	return SUCCESS;
 }
@@ -1471,8 +1516,8 @@ static int client_rx_file(struct ctx *ctx, int fd)
 
 static int cli_rx_file(struct ctx *ctx, int afd)
 {
-	uint16_t port;
 	int ret, fd;
+	uint16_t port;
 
 	/* open a passive TCP socket as the file sink */
 	ret = client_open_stream_sink(&port, &fd);
@@ -1497,6 +1542,45 @@ static int cli_rx_file(struct ctx *ctx, int afd)
 
 	/* and exit the program gracefully */
 	return EXIT_SUCCESS;
+}
+
+static int cli_open_file_sink(struct ctx *ctx)
+{
+	int ret;
+	struct stat statbuf;
+	const char *remote_filename = ctx->cl_offer_info.filename;
+	const char *force_new_filename = ctx->opts->outfilename;
+	mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP;
+
+	if (force_new_filename) {
+		/* regardless if the file is already present, we
+		 * will overide the old content whitout any warning
+		 * message. If the user use the "-o" option then
+		 * he is a professional user[TM] */
+		ctx->cl_file_hndl.fd = open(force_new_filename, O_WRONLY | O_CREAT, mode);
+		if (ctx->cl_file_hndl.fd < 0) {
+			err_sys_die(EXIT_FAILFILE, "Cannot open file %s for writing",
+					force_new_filename);
+		}
+		return SUCCESS;
+	}
+
+	/* now look if this file is already in the current
+	 * working directory */
+	ret = stat(remote_filename, &statbuf);
+	if (ret == 0)
+		err_msg_die(EXIT_FAILMISC, "remote file \"%s\" already present!"
+				" Please rename the old file or use the option -o"
+				" <out-filename to specify an alternative filename",
+				remote_filename);
+
+	ctx->cl_file_hndl.fd = open(remote_filename, O_WRONLY | O_CREAT | O_EXCL, mode);
+	if (ctx->cl_file_hndl.fd < 0) {
+		err_sys_die(EXIT_FAILFILE, "Cannot open file %s for writing",
+				force_new_filename);
+	}
+
+	return SUCCESS;
 }
 
 
@@ -1525,7 +1609,13 @@ int client_mode(struct ctx *ctx)
 		/* fine, we received a valid offer! We will
 		 * now open a passice TCP socket, announce this
 		 * port to the server and wait for the file from
-		 * the server. That's all ;) */
+		 * the server. But first we will open the filesink
+		 * where we store the new data */
+		ret = cli_open_file_sink(ctx);
+		if (ret != SUCCESS) {
+			pr_debug("failure in open the data sink");
+		}
+
 		ret = cli_rx_file(ctx, afd);
 		if (ret == SUCCESS) {
 			pr_debug("file transfer completed, exiting now");
@@ -1537,6 +1627,7 @@ int client_mode(struct ctx *ctx)
 
 	return EXIT_SUCCESS;
 }
+
 
 struct ctx *init_ctx(void)
 {
@@ -1550,6 +1641,17 @@ struct ctx *init_ctx(void)
 
 void free_ctx(struct ctx *c)
 {
+	switch (c->mode) {
+		case MODE_SERVER:
+			close(c->srv_file_hndl.fd);
+			break;
+		case MODE_CLIENT:
+			break;
+		default:
+			err_msg_die(EXIT_FAILINT, "Internal error in switch/case statement");
+			break;
+	};
+
 	if (c->cl_offer_info.filename)
 		free(c->cl_offer_info.filename);
 
@@ -1566,6 +1668,8 @@ int main(int ac, char **av)
 	if (ret != SUCCESS)
 		err_msg_die(EXIT_FAILMISC, "Cannot initialize random seed");
 
+	umask(0);
+
 	ctx = init_ctx();
 
 	/* opts defaults */
@@ -1580,10 +1684,11 @@ int main(int ac, char **av)
 			{"ipv4",            0, 0, '4'},
 			{"ipv6",            0, 0, '6'},
 			{"port",            0, 0, 'p'},
+			{"output",          0, 0, 'o'},
 			{0, 0, 0, 0}
 		};
 
-		c = getopt_long(ac, av, "b:p:h46",
+		c = getopt_long(ac, av, "o:b:p:h46",
 						long_options, &option_index);
 		if (c == -1)
 			break;
@@ -1597,6 +1702,9 @@ int main(int ac, char **av)
 				break;
 			case 'p':
 				ctx->opts->port = xstrdup(optarg);
+				break;
+			case 'o':
+				ctx->opts->outfilename = xstrdup(optarg);
 				break;
 			case 'b':
 				ctx->opts->rx_buf_size = xatoi(optarg);
@@ -1620,12 +1728,14 @@ int main(int ac, char **av)
 
 	if (optind >= ac) {
 		/* FIXME: catch the case where more files are given */
+		ctx->mode = MODE_CLIENT;
 		error = client_mode(ctx);
 		goto out_client;
 	}
 
 	ctx->opts->filename = xstrdup(av[optind]);
 
+	ctx->mode = MODE_SERVER;
 	error = server_mode(ctx);
 	goto out_server;
 
