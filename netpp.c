@@ -211,7 +211,7 @@ struct cl_offer_info {
 
 struct cl_srv_addr_info {
 	struct sockaddr_storage ss;
-	ssize_t ss_len;
+	socklen_t ss_len;
 };
 
 struct srv_cl_request_info {
@@ -220,7 +220,7 @@ struct srv_cl_request_info {
 
 struct srv_cl_addr_info {
 	struct sockaddr_storage ss;
-	ssize_t ss_len;
+	socklen_t ss_len;
 };
 
 struct srv_file_hndl {
@@ -264,7 +264,7 @@ int subtime(struct timeval *op1, struct timeval *op2,
 	return sign;
 }
 
-static double tv_to_sec(struct timeval *tv)
+double tv_to_sec(struct timeval *tv)
 {
 	return (double)tv->tv_sec + (double)tv->tv_usec * 1000000;
 }
@@ -829,7 +829,7 @@ static int set_non_blocking(int fd)
 
 int init_passive_socket(const char *addr, const char *port, int must_block)
 {
-	int fd = -1, ret;
+	int fd = -1;
 	struct addrinfo hosthints, *hostres, *addrtmp;
 	char addr_name[NI_MAXHOST];
 
@@ -872,31 +872,27 @@ int init_passive_socket(const char *addr, const char *port, int must_block)
 	return fd;
 }
 
-
-struct file_hndl {
-	const char *name;
-	off_t size;
-};
-
-
-
-static int init_file_hndl(struct ctx *ctx)
+static int xopen(const char *file)
 {
-	int ret;
-	struct file_hndl *file_hndl;
+	int fd;
+
+	fd = open(file, O_RDONLY);
+	if (fd < 0) {
+		err_sys("cannot open file %s", file);
+		return FAILURE;
+	}
+
+	return fd;
+}
+
+static int srv_init_file_hndl(struct ctx *ctx)
+{
 	struct stat statb;
 
 	ctx->srv_file_hndl.name = ctx->opts->filename;
-	ctx->srv_file_hndl.fd = open(ctx->srv_file_hndl.name, O_RDONLY);
-	if (ctx->srv_file_hndl.fd < 0)
-		err_sys_die(EXIT_FAILFILE, "Cannot open the file %s!",
-				ctx->srv_file_hndl.name);
+	ctx->srv_file_hndl.fd = xopen(ctx->srv_file_hndl.name);
 
-	ret = fstat(ctx->srv_file_hndl.fd, &statb);
-	if (ret < 0) {
-		err_sys_die(EXIT_FAILFILE, "Cannot open file %s!",
-				ctx->srv_file_hndl.name);
-	}
+	xfstat(ctx->srv_file_hndl.fd, &statb, ctx->srv_file_hndl.name);
 
 	ctx->srv_file_hndl.filesize = statb.st_size;
 
@@ -912,6 +908,15 @@ static int init_file_hndl(struct ctx *ctx)
 	return SUCCESS;
 }
 
+/* serveral operations are done of the open fd
+ * There are several possibilities like seek(fd) to
+ * the beginning to the file or: close and reopen
+ * the file again */
+static void srv_reopen_file(struct ctx *ctx)
+{
+	close(ctx->srv_file_hndl.fd);
+	ctx->srv_file_hndl.fd = xopen(ctx->srv_file_hndl.name);
+}
 
 static int init_active_socket(const char *addr, const char *port)
 {
@@ -956,12 +961,6 @@ static int init_active_socket(const char *addr, const char *port)
 
 	return sock;
 }
-
-struct srv_offer_data {
-	uint32_t size;
-	uint32_t filename_len;
-	char *name;
-};
 
 
 static char *xstrdup(const char *s)
@@ -1016,13 +1015,6 @@ static int decode_offer_pdu(struct ctx *ctx, char *pdu, size_t pdu_len)
 }
 
 
-static void free_srv_offer_data(struct srv_offer_data *s)
-{
-	assert(s && s->name);
-	free(s->name); free(s);
-}
-
-
 static size_t encode_offer_pdu(struct ctx *ctx, unsigned char *pdu, size_t max_pdu_len)
 {
 	unsigned char *ptr = pdu;
@@ -1071,20 +1063,13 @@ static int srv_tx_offer_pdu(struct ctx *ctx, int fd)
 
 #define	RX_BUF 512
 
-struct client_request_info {
-	struct sockaddr_storage sa_storage;
-	ssize_t ss_len;
-	struct request_pdu_hdr request_pdu_hdr;
-};
-
-
-static int srv_try_rx_client_pdu(int pfd, struct client_request_info **cri)
+static int srv_try_rx_client_pdu(struct ctx *ctx, int pfd)
 {
 	ssize_t ret;
 	unsigned char rx_buf[RX_BUF];
 	struct sockaddr_storage ss;
 	socklen_t ss_len = sizeof(ss);
-	struct client_request_info *client_request_info;
+	struct request_pdu_hdr *request_pdu_hdr;
 
 	ret = recvfrom(pfd, rx_buf, RX_BUF, 0, (struct sockaddr *)&ss, &ss_len);
 	if (ret < 0 && !(errno == EWOULDBLOCK)) {
@@ -1098,53 +1083,43 @@ static int srv_try_rx_client_pdu(int pfd, struct client_request_info **cri)
 		return FAILURE;
 	}
 
-	client_request_info = xzalloc(sizeof(*client_request_info));
+	request_pdu_hdr = (struct request_pdu_hdr *)rx_buf;
 
-	/* save client request message */
-	memcpy(&client_request_info->request_pdu_hdr,
-		   rx_buf, sizeof(struct request_pdu_hdr));
 
 	/* save client address */
-	client_request_info->ss_len = ss_len;
-	memcpy(&client_request_info->sa_storage, &ss,
-		   sizeof(client_request_info->sa_storage));
+	ctx->srv_cl_addr_info.ss_len = ss_len;
+	memcpy(&ctx->srv_cl_addr_info.ss, &ss,
+			sizeof(ctx->srv_cl_addr_info.ss));
 
-	/* convert message into host byte order */
-	client_request_info->request_pdu_hdr.port =
-		htons(client_request_info->request_pdu_hdr.port);
+	/* save & convert message into host byte order */
+	ctx->srv_cl_request_info.port = htons(request_pdu_hdr->port);
 
-	*cri = client_request_info;
 
 	pr_debug("client requested to open a new TCP data socket on port %u",
-			  client_request_info->request_pdu_hdr.port);
+			  ctx->srv_cl_request_info.port);
 
 	return SUCCESS;
 }
 
 
-static void free_client_request_info(struct client_request_info *c)
-{
-	free(c);
-}
-
-static ssize_t xsendfile(int connected_fd, int file_fd, struct stat *stat_buf)
+static ssize_t xsendfile(struct ctx *ctx, int connected_fd, int file_fd)
 {
 	ssize_t rc, write_cnt;
-	off_t offset = 0;
+	off_t offset = 0, filesize;
 	int tx_calls = 0;
 
 	pr_debug("now try to transfer the file to the peer");
 
-	write_cnt = stat_buf->st_size;
+	filesize = write_cnt = ctx->srv_file_hndl.filesize;
 
-	while (stat_buf->st_size - offset - 1 >= write_cnt) {
+	while (filesize - offset - 1 >= write_cnt) {
 		rc = sendfile(connected_fd, file_fd, &offset, write_cnt);
 		if (rc == -1)
 			err_sys_die(EXIT_FAILNET, "Failure in sendfile routine");
 		tx_calls++;
 	}
 	/* and write remaining bytes, if any */
-	write_cnt = stat_buf->st_size - offset - 1;
+	write_cnt = filesize - offset - 1;
 	if (write_cnt >= 0) {
 		rc = sendfile(connected_fd, file_fd, &offset, write_cnt + 1);
 		if (rc == -1)
@@ -1152,25 +1127,24 @@ static ssize_t xsendfile(int connected_fd, int file_fd, struct stat *stat_buf)
 		 tx_calls++;
 	}
 
-	if (offset != stat_buf->st_size)
+	if (offset != filesize)
 		err_msg_die(EXIT_FAILNET, "Incomplete transfer from sendfile: %d of %ld bytes",
-					offset , stat_buf->st_size);
+					offset , filesize);
 
 	pr_debug("transmitted %d bytes with %d calls via sendfile()",
-			 stat_buf->st_size, tx_calls);
+			 filesize, tx_calls);
 
 	return rc;
 }
 
-static int srv_open_active_connection(const char *hostname,
-		const struct client_request_info *cri)
+static int srv_open_active_connection(struct ctx *ctx, const char *hostname)
 {
-	int ret, fd = -1, on = 1;
+	char sport[16];
+	int ret, fd = -1;
 	struct addrinfo hosthints, *hostres, *addrtmp;
-	uint16_t tport; char sport[16];
 	struct protoent *protoent;
 
-	snprintf(sport, sizeof(sport) - 1, "%d", cri->request_pdu_hdr.port);
+	snprintf(sport, sizeof(sport) - 1, "%d", ctx->srv_cl_request_info.port);
 
 	memset(&hosthints, 0, sizeof(struct addrinfo));
 
@@ -1212,52 +1186,34 @@ static int srv_open_active_connection(const char *hostname,
 	return fd;
 }
 
-static int srv_open_file(const char *file)
+
+static void srv_tx_file(struct ctx *ctx)
 {
-	int fd;
-
-	fd = open(file, O_RDONLY);
-	if (fd < 0) {
-		err_sys("cannot open file %s", file);
-		return FAILURE;
-	}
-
-	return fd;
-}
-
-static void srv_tx_file(const struct client_request_info *cri, const char *file)
-{
-	int ret, file_fd, net_fd;
+	int file_fd, net_fd;
 	char peer[1024], portstr[8];
-	struct stat stat_buf;
 
-
-	(void) file;
-
-	xgetnameinfo((struct sockaddr *)&cri->sa_storage, cri->ss_len, peer,
+	xgetnameinfo((struct sockaddr *)&ctx->srv_cl_addr_info.ss,
+			ctx->srv_cl_addr_info.ss_len, peer,
 			sizeof(peer), portstr, sizeof(portstr),
 			NI_NUMERICSERV | NI_NUMERICHOST);
 
 	pr_debug("received file request pdu from %s:%s", peer, portstr);
-	pr_debug("client wait for data at TCP port %d", cri->request_pdu_hdr.port);
+	pr_debug("client wait for data at TCP port %d", ctx->srv_cl_request_info.port);
 
-	file_fd = srv_open_file(file);
-	if (file_fd < 0)
-		return;
+	file_fd = ctx->srv_file_hndl.fd;
 
-	net_fd = srv_open_active_connection(peer, cri);
+	net_fd = srv_open_active_connection(ctx, peer);
 	if (net_fd < 0) {
 		close(file_fd);
 		err_msg("cannot open a TCP connection to the peer, ignoring this client");
 	}
 
-	xfstat(file_fd, &stat_buf, file);
-
-	ret = xsendfile(net_fd, file_fd, &stat_buf); // XXX, catch error
+	xsendfile(ctx, net_fd, file_fd);
 
 	close(net_fd);
 	close(file_fd);
 }
+
 
 
 /* In server mode the program sends in regular interval
@@ -1268,8 +1224,6 @@ static void srv_tx_file(const struct client_request_info *cri, const char *file)
 int server_mode(struct ctx *ctx)
 {
 	int pfd, afd, ret;
-	struct client_request_info *client_request_info;
-	struct file_hndl *file_hndl;
 	int must_block = 0;
 	const char *port, *filename;
 
@@ -1278,7 +1232,7 @@ int server_mode(struct ctx *ctx)
 
 	pr_debug("netpp [server mode, serving file %s]", filename);
 
-	ret = init_file_hndl(ctx);
+	ret = srv_init_file_hndl(ctx);
 	if (ret != SUCCESS)
 		err_msg_die(EXIT_FAILFILE, "Cannot open and setup the file");
 
@@ -1293,13 +1247,13 @@ int server_mode(struct ctx *ctx)
 		}
 
 		while (666) { /* handle all backloged client requests */
-			ret = srv_try_rx_client_pdu(pfd, &client_request_info);
+			ret = srv_try_rx_client_pdu(ctx, pfd);
 			if (ret != SUCCESS)
 				break;
 
-			srv_tx_file(client_request_info, filename);
+			srv_tx_file(ctx);
 
-			free_client_request_info(client_request_info);
+			srv_reopen_file(ctx);
 		}
 
 		sleep(1);
@@ -1312,19 +1266,11 @@ int server_mode(struct ctx *ctx)
 	return EXIT_SUCCESS;
 }
 
-struct srv_offer_info {
-	struct sockaddr_storage srv_ss;
-	ssize_t server_ss_len;
-	char *srv_offer_pdu;
-	size_t srv_offer_pdu_len;
-};
-
 
 static int client_try_read_offer_pdu(struct ctx *ctx, int pfd)
 {
 	ssize_t ret;
 	char rx_buf[RX_BUF];
-	struct srv_offer_data *sad;
 
 	ctx->cl_srv_addr_info.ss_len = sizeof(ctx->cl_srv_addr_info.ss);
 
@@ -1426,6 +1372,8 @@ static int client_inform_server(const struct ctx *ctx, int afd, uint16_t port)
 	ssize_t ret;
 	struct request_pdu_hdr request_pdu_hdr;
 
+	(void) ctx;
+
 	memset(&request_pdu_hdr, 0, sizeof(request_pdu_hdr));
 
 	request_pdu_hdr.port = htons(port);
@@ -1468,7 +1416,6 @@ static int client_read_and_save_file(struct ctx *ctx, int fd)
 	char *buf;
 	ssize_t rc;
 	unsigned long rx_calls, rx_bytes, chunks;
-	struct progress_ctx *progress_ctx;
 	int i = 1;
 
 	rx_calls = rx_bytes = 0;
