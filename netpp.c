@@ -239,6 +239,10 @@ struct srv_file_hndl {
 	off_t filesize;
 };
 
+struct srv_state {
+	uint16_t cookie;
+};
+
 struct ctx {
 	int mode;
 	struct opts *opts;
@@ -247,6 +251,7 @@ struct ctx {
 	struct cl_srv_addr_info cl_srv_addr_info;
 	struct cl_file_hndl cl_file_hndl;
 	/* server stuff */
+	struct srv_state srv_state;
 	struct srv_cl_request_info srv_cl_request_info;
 	struct srv_cl_addr_info srv_cl_addr_info;
 	struct srv_file_hndl srv_file_hndl;
@@ -1051,7 +1056,9 @@ static size_t encode_offer_pdu(struct ctx *ctx, unsigned char *pdu, size_t max_p
 }
 
 
-#define	OFFER_PDU_LEN_MAX 512
+/* a little bit over the 802.3 limit but who
+ * knowns who use this tool and whose MTU ;-) */
+#define	OFFER_PDU_LEN_MAX 2048
 
 static int srv_tx_offer_pdu(struct ctx *ctx, int fd)
 {
@@ -1185,8 +1192,8 @@ static int srv_open_active_connection(struct ctx *ctx, const char *hostname)
 
 	if (fd < 0)
 		err_msg_die(EXIT_FAILNET,
-				"Don't found a suitable socket to connect to the client"
-				" TCP socket, giving up");
+				"Don't found a suitable TCP socket to connect to the client"
+				", giving up");
 
 	freeaddrinfo(hostres);
 
@@ -1224,6 +1231,20 @@ static void srv_tx_file(struct ctx *ctx)
 }
 
 
+static int srv_init_state(struct ctx *ctx)
+{
+	struct srv_state srv_state = ctx->srv_state;
+
+	/* initialize random server cookie */
+	srv_state.cookie = random();
+
+	pr_debug("initialize random server cookie to %u",
+			srv_state.cookie);
+
+	return SUCCESS;
+}
+
+
 
 /* In server mode the program sends in regular interval
  * a UDP offer PDU to a well known multicast address.
@@ -1244,6 +1265,10 @@ int server_mode(struct ctx *ctx)
 	ret = srv_init_file_hndl(ctx);
 	if (ret != SUCCESS)
 		err_msg_die(EXIT_FAILFILE, "Cannot open and setup the file");
+
+	ret = srv_init_state(ctx);
+	if (ret != SUCCESS)
+		err_msg_die(EXIT_FAILMISC, "Cannot initialize server state");
 
 	pfd = init_passive_socket(DEFAULT_V4_MULT_ADDR, port, must_block);
 	afd = init_active_socket(DEFAULT_V4_MULT_ADDR, port);
