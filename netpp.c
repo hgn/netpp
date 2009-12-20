@@ -1082,10 +1082,10 @@ static int srv_tx_offer_pdu(struct ctx *ctx, int fd)
 static int srv_try_rx_client_pdu(struct ctx *ctx, int pfd)
 {
 	ssize_t ret;
-	unsigned char rx_buf[RX_BUF];
 	struct sockaddr_storage ss;
 	socklen_t ss_len = sizeof(ss);
 	struct request_pdu_hdr *request_pdu_hdr;
+	unsigned char rx_buf[RX_BUF];
 
 	ret = recvfrom(pfd, rx_buf, RX_BUF, 0, (struct sockaddr *)&ss, &ss_len);
 	if (ret < 0 && !(errno == EWOULDBLOCK)) {
@@ -1155,10 +1155,10 @@ static ssize_t xsendfile(struct ctx *ctx, int connected_fd, int file_fd)
 
 static int srv_open_active_connection(struct ctx *ctx, const char *hostname)
 {
-	char sport[16];
 	int ret, fd = -1;
 	struct addrinfo hosthints, *hostres, *addrtmp;
 	struct protoent *protoent;
+	char sport[16];
 
 	snprintf(sport, sizeof(sport) - 1, "%d", ctx->srv_cl_request_info.port);
 
@@ -1302,9 +1302,9 @@ int server_mode(struct ctx *ctx)
 
 static void cl_print_srv_offer(const struct ctx *ctx)
 {
-	char peer[1024], portstr[8];
-	uint32_t filesize = ctx->cl_offer_info.file_size;
+	const uint32_t filesize = ctx->cl_offer_info.file_size;
 	const char *prefix; int divisor; double pretty_filesize;
+	char peer[1024], portstr[8];
 
 	if (filesize > 1024 * 1024 * 1024) {
 		prefix  = "GiB";
@@ -1458,8 +1458,8 @@ static int client_wait_for_accept(int fd)
 {
 	struct sockaddr_storage sa;
 	socklen_t sa_len = sizeof(sa);
-	char peer[1024], portstr[8];
 	int connected_fd = -1;
+	char peer[1024], portstr[8];
 
 	connected_fd = accept(fd, (struct sockaddr *) &sa, &sa_len);
 	if (connected_fd == -1)
@@ -1476,11 +1476,10 @@ static int client_wait_for_accept(int fd)
 
 static int client_read_and_save_file(struct ctx *ctx, int fd)
 {
-	int ret, buflen;
-	char *buf;
-	ssize_t rc;
 	unsigned long rx_calls, rx_bytes, chunks;
-	int i = 1;
+	int ret, buflen, i = 1;
+	ssize_t rc;
+	char *buf;
 
 	rx_calls = rx_bytes = 0;
 
