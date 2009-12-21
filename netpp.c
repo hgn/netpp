@@ -41,6 +41,9 @@
 #include <limits.h>
 #include <netdb.h>
 
+#include <openssl/evp.h>
+#include <openssl/sha.h>
+
 #ifdef HAVE_RDTSCLL
 # include <linux/timex.h>
 
@@ -165,22 +168,9 @@ static const int debug_enabled = 0;
 #define	DEFAULT_V4_MULT_ADDR "224.110.99.112"
 #define DEFAULT_LISTEN_PORT "6666"
 
-enum {
-	MODE_SERVER = 1,
-	MODE_CLIENT
-};
-
-struct opts {
-	int wanted_af_family;
-	int rx_buf_size;
-	char *me;
-	char *port;
-	char *filename;
-	char *outfilename;
-};
-
 #define	OFFER_PDU_MAGIC 0x2323
-#define	OFFER_PDU_VERSION 0x01
+
+#define	OPCODE_OFFER 0x01
 
 struct offer_pdu_hdr {
 	uint16_t magic;
@@ -201,6 +191,12 @@ struct offer_pdu_tlv_file {
 	char filename[FLEX_ARRAY]; /* must end on a 4 byte boundary */
 } __attribute__((packed));
 
+struct offer_pdu_tlv_sha1 {
+	uint16_t type;
+	uint16_t len;
+	char digest[SHA_DIGEST_LENGTH];
+};
+
 /* this message is sent from the client to the
  * server and signals that the client received
  * correctly a offer PDU, opens a passive TCP socket
@@ -208,6 +204,23 @@ struct offer_pdu_tlv_file {
 struct request_pdu_hdr {
 	uint16_t port;
 } __attribute__((packed));
+
+enum {
+	MODE_SERVER = 1,
+	MODE_CLIENT
+};
+
+#define	SHA1_CHECK_MASK (1<<1)
+
+struct opts {
+	int wanted_af_family;
+	int rx_buf_size;
+	char *me;
+	char *port;
+	char *filename;
+	char *outfilename;
+	uint32_t features; /* sha1, ... */
+};
 
 struct cl_offer_info {
 	uint32_t file_size;
@@ -241,6 +254,9 @@ struct srv_file_hndl {
 
 struct srv_state {
 	uint16_t cookie;
+	char *offer_pdu;
+	size_t offer_pdu_len;
+	unsigned long no_query;
 };
 
 struct ctx {
@@ -746,7 +762,11 @@ static void xgetnameinfo(const struct sockaddr *sa, socklen_t salen,
 
 static void usage(const char *me)
 {
-	fprintf(stdout, "%s (-4|-6) (-b <rx-buffer-size>) (-p <port>) (-o <output-filename>) [filename]\n", me);
+	fprintf(stderr,
+			"%s (-4|-6) (-b <rx-buffer-size>) "
+			"(-p <port>) (-o <output-filename>)"
+			"[filename]\n",
+			me);
 }
 
 
@@ -1055,6 +1075,86 @@ static size_t encode_offer_pdu(struct ctx *ctx, unsigned char *pdu, size_t max_p
 	return len;
 }
 
+static size_t srv_construct_offer_pdu_hdr(struct ctx *ctx,
+		struct offer_pdu_hdr *hdr, size_t len)
+{
+	const uint16_t cookie = ctx->srv_state.cookie;
+
+	hdr->magic  = htons(OFFER_PDU_MAGIC);
+	hdr->cookie = htons(cookie);
+	hdr->opcode = htons(OPCODE_OFFER);
+	hdr->len    = htons(len);
+
+	/* constant header len */
+	return sizeof(*hdr);
+}
+
+static size_t srv_construct_offer_pdu_tlv_file(struct ctx *ctx,
+		struct offer_pdu_tlv_file *hdr, size_t filename_len,
+		size_t padding)
+{
+	unsigned len = 2 + 2 + 4 + 4 + filename_len + padding;
+
+	hdr->type = htons(OFFER_TLV_FILE);
+	hdr->len  = htons(len);
+	hdr->filesize = htonl(ctx->srv_file_hndl.filesize);
+	hdr->filename_len = htonl(filename_len);
+
+	memset(hdr->filename, 0, filename_len + padding);
+
+	memcpy(hdr->filename, ctx->srv_file_hndl.name,
+			strlen(ctx->srv_file_hndl.name) + 1);
+
+	return len;
+}
+
+static size_t srv_construct_offer_pdu(struct ctx *ctx)
+{
+	size_t pdu_len = 0, filename_len, pdu_padding = 0, offset = 0;
+	struct offer_pdu_tlv_file *offer_pdu_tlv_file;
+	struct offer_pdu_tlv_sha1 *offer_pdu_tlv_sha1;
+	struct srv_state srv_state = ctx->srv_state;
+	char *pdu;
+
+	filename_len = strlen(ctx->srv_file_hndl.name);
+
+	/* standard header size */
+	pdu_len  = sizeof(struct offer_pdu_hdr);
+	pdu_len += sizeof(struct offer_pdu_tlv_file);
+
+	/* plus variable filename size */
+	pdu_len += filename_len;
+	/* make sure we pad our filename */
+	if (filename_len % 4 != 0) {
+		pdu_padding = 4 - (filename_len % 4);
+		pdu_len += pdu_padding;
+	}
+
+	/* add SHA1 TLV length */
+	if (ctx->opts->features & SHA1_CHECK_MASK) {
+		pdu_len += sizeof(*offer_pdu_tlv_sha1);
+		/* SHA_DIGEST_LENGTH is 20, therefore the
+		 * padding is perfect suited for our TLV
+		 * encoding */
+		assert(sizeof(*offer_pdu_tlv_sha1) % 4 == 0);
+	}
+
+	pdu = xzalloc(pdu_len);
+
+	offset = srv_construct_offer_pdu_hdr(ctx,
+			(struct offer_pdu_hdr *)pdu, pdu_len);
+
+	offer_pdu_tlv_file = pdu + offset;
+	offset += srv_construct_offer_pdu_tlv_file(ctx, offer_pdu_tlv_file,
+			filename_len, pdu_padding);
+
+	/* make the constructed PDU now persistent */
+	srv_state.offer_pdu     = pdu;
+	srv_state.offer_pdu_len = pdu_len;
+
+	return SUCCESS;
+}
+
 
 /* a little bit over the 802.3 limit but who
  * knowns who use this tool and whose MTU ;-) */
@@ -1144,8 +1244,9 @@ static ssize_t xsendfile(struct ctx *ctx, int connected_fd, int file_fd)
 	}
 
 	if (offset != filesize)
-		err_msg_die(EXIT_FAILNET, "Incomplete transfer from sendfile: %d of %ld bytes",
-					offset , filesize);
+		err_msg_die(EXIT_FAILNET,
+				"Incomplete transfer from sendfile: %d of %ld bytes",
+				offset , filesize);
 
 	pr_debug("transmitted %d bytes with %d calls via sendfile()",
 			 filesize, tx_calls);
@@ -1213,7 +1314,10 @@ static void srv_tx_file(struct ctx *ctx)
 			sizeof(peer), portstr, sizeof(portstr),
 			NI_NUMERICSERV | NI_NUMERICHOST);
 
-	pr_debug("received file request pdu from %s:%s", peer, portstr);
+	/* FIXME: something with the counter is wrong */
+	fprintf(stderr, "\rreceived %lu file query from %s port %s, now serving client",
+			ctx->srv_state.no_query++, peer, portstr);
+
 	pr_debug("client wait for data at TCP port %d", ctx->srv_cl_request_info.port);
 
 	file_fd = ctx->srv_file_hndl.fd;
@@ -1238,10 +1342,38 @@ static int srv_init_state(struct ctx *ctx)
 	/* initialize random server cookie */
 	srv_state.cookie = random();
 
+	/* to count the number of client requests */
+	srv_state.no_query = 1;
+
 	pr_debug("initialize random server cookie to %u",
 			srv_state.cookie);
 
 	return SUCCESS;
+}
+
+static void print_pretty_size(FILE *fd, off_t size)
+{
+	double pretty_filesize;
+	const char *prefix;
+	unsigned divisor;
+
+	if (size > 1024 * 1024 * 1024) {
+		prefix  = "GiB";
+		divisor = 1024 * 1024 * 1024;
+	} else if (size > 1024 * 1024) {
+		prefix  = "MiB";
+		divisor = 1024 * 1024;
+	} else if (size > 1024) {
+		prefix  = "KiB";
+		divisor = 1024;
+	} else {
+		prefix  = "Byte";
+		divisor = 1;
+	}
+
+	pretty_filesize = (double)size / divisor;
+
+	fprintf(fd, "%.2lf %s", pretty_filesize, prefix);
 }
 
 
@@ -1260,8 +1392,6 @@ int server_mode(struct ctx *ctx)
 	port = ctx->opts->port ?: DEFAULT_LISTEN_PORT;
 	filename = ctx->opts->filename;
 
-	pr_debug("netpp [server mode, serving file %s]", filename);
-
 	ret = srv_init_file_hndl(ctx);
 	if (ret != SUCCESS)
 		err_msg_die(EXIT_FAILFILE, "Cannot open and setup the file");
@@ -1272,6 +1402,16 @@ int server_mode(struct ctx *ctx)
 
 	pfd = init_passive_socket(DEFAULT_V4_MULT_ADDR, port, must_block);
 	afd = init_active_socket(DEFAULT_V4_MULT_ADDR, port);
+
+	fprintf(stderr, "netpp operating in active mode (filename: %s, size: ",
+			filename);
+	print_pretty_size(stderr, ctx->srv_file_hndl.filesize);
+	fprintf(stderr, ")\n");
+
+	ret = srv_construct_offer_pdu(ctx);
+	if (ret != SUCCESS) {
+		err_msg_die(EXIT_FAILNET, "Failure in offer broadcast");
+	}
 
 	while (23) {
 
@@ -1293,6 +1433,7 @@ int server_mode(struct ctx *ctx)
 		sleep(1);
 	}
 
+	free(ctx->srv_state.offer_pdu);
 	close(ctx->srv_file_hndl.fd);
 	close(afd);
 	close(pfd);
@@ -1340,7 +1481,8 @@ static int client_try_read_offer_pdu(struct ctx *ctx, int pfd)
 	ctx->cl_srv_addr_info.ss_len = sizeof(ctx->cl_srv_addr_info.ss);
 
 	ret = recvfrom(pfd, rx_buf, RX_BUF, 0,
-			(struct sockaddr *)&ctx->cl_srv_addr_info.ss, &ctx->cl_srv_addr_info.ss_len);
+			(struct sockaddr *)&ctx->cl_srv_addr_info.ss,
+			&ctx->cl_srv_addr_info.ss_len);
 	if (ret < 0) {
 		err_sys_die(EXIT_FAILNET, "failed to read()");
 	}
@@ -1613,7 +1755,7 @@ int client_mode(struct ctx *ctx)
 	int pfd, afd, ret, must_block = 1;
 	const char *port = ctx->opts->port ?: DEFAULT_LISTEN_PORT;
 
-	pr_debug("netpp [client mode]");
+	fprintf(stderr, "netpp operating in passive mode\n");
 
 	pfd = init_passive_socket(DEFAULT_V4_MULT_ADDR, port, must_block);
 	afd = init_active_socket(DEFAULT_V4_MULT_ADDR, port);
@@ -1659,6 +1801,7 @@ struct ctx *init_ctx(void)
 	return ctx;
 }
 
+/* FIXME: call me! */
 void free_ctx(struct ctx *c)
 {
 	switch (c->mode) {
@@ -1696,6 +1839,7 @@ int main(int ac, char **av)
 	ctx->opts->wanted_af_family = PF_UNSPEC;
 	ctx->opts->me = xstrdup(av[0]);
 	ctx->opts->rx_buf_size = DEFAULT_RX_BUF_SIZE;
+	ctx->opts->features = SHA1_CHECK_MASK;
 
 	while (1) {
 		int option_index = 0;
