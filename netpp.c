@@ -159,6 +159,13 @@ static const int debug_enabled = 0;
 #define SUCCESS 0
 #define FAILURE -1
 
+/* set to maximum queue length specifiable by listen */
+#define	DEFAULT_TCP_BACKLOG SOMAXCONN
+
+/* follow IANA suggestions */
+#define	EPHEMERAL_PORT_MIN 49152
+#define	EPHEMERAL_PORT_MAX 65534
+
 #define RANDPOOLSRC "/dev/urandom"
 
 #define MAXERRMSG 1024
@@ -273,7 +280,7 @@ struct ctx {
 	struct srv_file_hndl srv_file_hndl;
 };
 
-int subtime(struct timeval *op1, struct timeval *op2,
+static int subtime(struct timeval *op1, struct timeval *op2,
 				   struct timeval *result)
 {
 	int borrow = 0, sign = 0;
@@ -297,9 +304,9 @@ int subtime(struct timeval *op1, struct timeval *op2,
 	return sign;
 }
 
-double tv_to_sec(struct timeval *tv)
+static double tv_to_sec(struct timeval *tv)
 {
-	return (double)tv->tv_sec + (double)tv->tv_usec * 1000000;
+	return (double)tv->tv_sec + (double)tv->tv_usec / 1000000;
 }
 
 
@@ -394,6 +401,7 @@ void xfstat(int filedes, struct stat *buf, const char *s)
 		err_sys_die(EXIT_FAILMISC, "Can't fstat file %s", s);
 }
 
+
 unsigned long long xstrtoull(const char *str)
 {
 	char *endptr;
@@ -412,6 +420,7 @@ unsigned long long xstrtoull(const char *str)
 
 	return val;
 }
+
 
 static int xatoi(const char *str)
 {
@@ -810,7 +819,6 @@ static void enable_multicast_v6(int fd, const struct addrinfo *a)
 	xsetsockopt(fd, IPPROTO_IPV6, IPV6_JOIN_GROUP,
 			&mreq6, sizeof(struct ipv6_mreq), "IPV6_JOIN_GROUP");
 	pr_debug("join IPv6 multicast group");
-
 }
 
 
@@ -841,8 +849,6 @@ static int socket_bind(const struct addrinfo *a)
 			abort();
 			break;
 	}
-
-	listen(fd, 5);
 
 	return fd;
 }
@@ -1108,15 +1114,34 @@ static size_t srv_construct_offer_pdu_tlv_file(struct ctx *ctx,
 	return len;
 }
 
+
+static size_t srv_construct_offer_pdu_tlv_sha1(struct ctx *ctx,
+		struct offer_pdu_tlv_sha1 *offer_pdu_tlv_sha1)
+{
+	(void) ctx;
+
+	memset(offer_pdu_tlv_sha1, 0, sizeof(*offer_pdu_tlv_sha1));
+
+	return sizeof(*offer_pdu_tlv_sha1);
+}
+
+
 static size_t srv_construct_offer_pdu(struct ctx *ctx)
 {
 	size_t pdu_len = 0, filename_len, pdu_padding = 0, offset = 0;
 	struct offer_pdu_tlv_file *offer_pdu_tlv_file;
 	struct offer_pdu_tlv_sha1 *offer_pdu_tlv_sha1;
-	struct srv_state srv_state = ctx->srv_state;
+	struct srv_state *srv_state = &ctx->srv_state;
 	char *pdu;
 
+	/* FIXME: we must limit the maximum filename length
+	 * and check this. Furthermore, we must remove any
+	 * path statements */
 	filename_len = strlen(ctx->srv_file_hndl.name);
+	if (filename_len <= 0) {
+		err_msg("filename to short: %d", filename_len);
+		return FAILURE;
+	}
 
 	/* standard header size */
 	pdu_len  = sizeof(struct offer_pdu_hdr);
@@ -1144,13 +1169,20 @@ static size_t srv_construct_offer_pdu(struct ctx *ctx)
 	offset = srv_construct_offer_pdu_hdr(ctx,
 			(struct offer_pdu_hdr *)pdu, pdu_len);
 
-	offer_pdu_tlv_file = pdu + offset;
+	offer_pdu_tlv_file = (struct offer_pdu_tlv_file *)pdu + offset;
 	offset += srv_construct_offer_pdu_tlv_file(ctx, offer_pdu_tlv_file,
 			filename_len, pdu_padding);
 
-	/* make the constructed PDU now persistent */
-	srv_state.offer_pdu     = pdu;
-	srv_state.offer_pdu_len = pdu_len;
+	if (ctx->opts->features & SHA1_CHECK_MASK) {
+		offer_pdu_tlv_sha1 = (struct offer_pdu_tlv_sha1 *)pdu + offset;
+		offset += srv_construct_offer_pdu_tlv_sha1(ctx,
+				offer_pdu_tlv_sha1);
+	}
+
+	/* make the constructed PDU now persistent,
+	 * will be deleted at programm termination */
+	srv_state->offer_pdu     = pdu;
+	srv_state->offer_pdu_len = pdu_len;
 
 	return SUCCESS;
 }
@@ -1303,20 +1335,49 @@ static int srv_open_active_connection(struct ctx *ctx, const char *hostname)
 	return fd;
 }
 
+/* FIXME: print_pretty_size_double() and print_pretty_size() should
+ * be united via an additional format string argument. Another solution
+ * is the outsource[TM] the common parts and group then in a value return
+ * function. Not sure at the moment what is the most suitable solution.  --HGN */
+static void print_pretty_size_double(FILE *fd, double size, const char *trail)
+{
+	double pretty_filesize;
+	const char *prefix;
+	unsigned divisor;
+
+	if (size > 1024 * 1024 * 1024) {
+		prefix  = "GiB";
+		divisor = 1024 * 1024 * 1024;
+	} else if (size > 1024 * 1024) {
+		prefix  = "MiB";
+		divisor = 1024 * 1024;
+	} else if (size > 1024) {
+		prefix  = "KiB";
+		divisor = 1024;
+	} else {
+		prefix  = "Byte";
+		divisor = 1;
+	}
+
+	pretty_filesize = (double)size / divisor;
+
+	fprintf(fd, "%.2lf %s%s", pretty_filesize, prefix, trail);
+}
 
 static void srv_tx_file(struct ctx *ctx)
 {
 	int file_fd, net_fd;
-	char peer[1024], portstr[8];
+	char peer[NI_MAXHOST];
+	struct timeval tv_start, tv_end, tv_res;
+	double goodput;
 
 	xgetnameinfo((struct sockaddr *)&ctx->srv_cl_addr_info.ss,
 			ctx->srv_cl_addr_info.ss_len, peer,
-			sizeof(peer), portstr, sizeof(portstr),
-			NI_NUMERICSERV | NI_NUMERICHOST);
+			sizeof(peer), NULL, 0,
+			NI_NUMERICHOST);
 
-	/* FIXME: something with the counter is wrong */
-	fprintf(stderr, "\rreceived %lu file query from %s port %s, now serving client",
-			ctx->srv_state.no_query++, peer, portstr);
+	fprintf(stderr, "file query (#%lu) from %s, now serving client, ...",
+			ctx->srv_state.no_query, peer);
 
 	pr_debug("client wait for data at TCP port %d", ctx->srv_cl_request_info.port);
 
@@ -1328,7 +1389,21 @@ static void srv_tx_file(struct ctx *ctx)
 		err_msg("cannot open a TCP connection to the peer, ignoring this client");
 	}
 
+	/* finally sent the file to the peer */
+	gettimeofday(&tv_start, NULL);
 	xsendfile(ctx, net_fd, file_fd);
+	gettimeofday(&tv_end, NULL);
+
+	/* calculate diff */
+	subtime(&tv_start, &tv_end, &tv_res);
+
+	fprintf(stderr, "\rfile query (#%lu) from %s, finished in %.2lf seconds (",
+			ctx->srv_state.no_query, peer, tv_to_sec(&tv_res));
+
+	goodput = (double)ctx->srv_file_hndl.filesize / tv_to_sec(&tv_res);
+	print_pretty_size_double(stderr, goodput, "/s)\n");
+
+	ctx->srv_state.no_query++;
 
 	close(net_fd);
 	close(file_fd);
@@ -1337,16 +1412,16 @@ static void srv_tx_file(struct ctx *ctx)
 
 static int srv_init_state(struct ctx *ctx)
 {
-	struct srv_state srv_state = ctx->srv_state;
+	struct srv_state *srv_state = &ctx->srv_state;
 
 	/* initialize random server cookie */
-	srv_state.cookie = random();
+	srv_state->cookie = random();
 
 	/* to count the number of client requests */
-	srv_state.no_query = 1;
+	srv_state->no_query = 1;
 
 	pr_debug("initialize random server cookie to %u",
-			srv_state.cookie);
+			srv_state->cookie);
 
 	return SUCCESS;
 }
@@ -1410,7 +1485,7 @@ int server_mode(struct ctx *ctx)
 
 	ret = srv_construct_offer_pdu(ctx);
 	if (ret != SUCCESS) {
-		err_msg_die(EXIT_FAILNET, "Failure in offer broadcast");
+		err_msg_die(EXIT_FAILNET, "Failure in Offer-PDU message generation");
 	}
 
 	while (23) {
@@ -1444,8 +1519,10 @@ int server_mode(struct ctx *ctx)
 static void cl_print_srv_offer(const struct ctx *ctx)
 {
 	const uint32_t filesize = ctx->cl_offer_info.file_size;
-	const char *prefix; int divisor; double pretty_filesize;
-	char peer[1024], portstr[8];
+	const char *prefix;
+	int divisor;
+	double pretty_filesize;
+	char peer[NI_MAXHOST], portstr[NI_MAXSERV];
 
 	if (filesize > 1024 * 1024 * 1024) {
 		prefix  = "GiB";
@@ -1501,19 +1578,12 @@ static int client_try_read_offer_pdu(struct ctx *ctx, int pfd)
 }
 
 
-/* follow IANA suggestions */
-#define	EPHEMERAL_PORT_MIN 49152
-#define	EPHEMERAL_PORT_MAX 65534
-
 static uint16_t dice_a_port(void)
 {
 	return (random() % (EPHEMERAL_PORT_MAX - EPHEMERAL_PORT_MIN)) + EPHEMERAL_PORT_MIN;
 }
 
-
-#define	DEFAULT_TCP_BACKLOG 6
-
-static int client_open_stream_sink(uint16_t *port, int *lfd)
+static int cli_open_stream_sink(uint16_t *port, int *lfd)
 {
 	int ret, fd = -1, on = 1;
 	const char *hostname = NULL;
@@ -1576,7 +1646,7 @@ static int client_open_stream_sink(uint16_t *port, int *lfd)
 }
 
 
-static int client_inform_server(const struct ctx *ctx, int afd, uint16_t port)
+static int cli_inform_server(const struct ctx *ctx, int afd, uint16_t port)
 {
 	ssize_t ret;
 	struct request_pdu_hdr request_pdu_hdr;
@@ -1596,12 +1666,12 @@ static int client_inform_server(const struct ctx *ctx, int afd, uint16_t port)
 	return SUCCESS;
 }
 
-static int client_wait_for_accept(int fd)
+static int cli_wait_for_accept(int fd)
 {
 	struct sockaddr_storage sa;
 	socklen_t sa_len = sizeof(sa);
 	int connected_fd = -1;
-	char peer[1024], portstr[8];
+	char peer[NI_MAXHOST], portstr[NI_MAXSERV];
 
 	connected_fd = accept(fd, (struct sockaddr *) &sa, &sa_len);
 	if (connected_fd == -1)
@@ -1616,7 +1686,7 @@ static int client_wait_for_accept(int fd)
 	return connected_fd;
 }
 
-static int client_read_and_save_file(struct ctx *ctx, int fd)
+static int cli_read_and_save_file(struct ctx *ctx, int fd)
 {
 	unsigned long rx_calls, rx_bytes, chunks;
 	int ret, buflen, i = 1;
@@ -1665,10 +1735,10 @@ static int client_rx_file(struct ctx *ctx, int fd)
 	int connected_fd;
 
 	/* block until the server connect to our socket */
-	connected_fd = client_wait_for_accept(fd);
+	connected_fd = cli_wait_for_accept(fd);
 
 	/* read the file from the new filedescriptor */
-	client_read_and_save_file(ctx, connected_fd);
+	cli_read_and_save_file(ctx, connected_fd);
 
 	close(connected_fd);
 
@@ -1682,13 +1752,13 @@ static int cli_rx_file(struct ctx *ctx, int afd)
 	uint16_t port;
 
 	/* open a passive TCP socket as the file sink */
-	ret = client_open_stream_sink(&port, &fd);
+	ret = cli_open_stream_sink(&port, &fd);
 	if (ret != SUCCESS) {
 		err_msg_die(EXIT_FAILNET, "Failed to create TCP socket");
 	}
 
 	/* inform the server about the newly created connection */
-	ret = client_inform_server(ctx, afd, port);
+	ret = cli_inform_server(ctx, afd, port);
 	if (ret != SUCCESS) {
 		err_msg_die(EXIT_FAILNET, "Can't inform the server, upps!");
 	}
