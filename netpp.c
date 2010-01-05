@@ -177,7 +177,8 @@ static const int debug_enabled = 0;
 
 #define	OFFER_PDU_MAGIC 0x2323
 
-#define	OPCODE_OFFER 0x01
+#define	OPCODE_OFFER   0x01
+#define	OPCODE_REQUEST 0x02
 
 struct offer_pdu_hdr {
 	uint16_t magic;
@@ -209,6 +210,10 @@ struct offer_pdu_tlv_sha1 {
  * correctly a offer PDU, opens a passive TCP socket
  * on port port and is now ready to receive the file */
 struct request_pdu_hdr {
+	uint16_t magic;
+	uint16_t cookie;
+	uint16_t opcode;
+	uint16_t len;
 	uint16_t port;
 } __attribute__((packed));
 
@@ -1070,6 +1075,7 @@ static int cli_destruct_offer_pdu_tlv_sha1(struct ctx *ctx,
 	return SUCCESS;
 }
 
+
 static int cli_destruct_offer_pdu(struct ctx *ctx, char *pdu, size_t offer_pdu_len)
 {
 	int ret;
@@ -1088,7 +1094,7 @@ static int cli_destruct_offer_pdu(struct ctx *ctx, char *pdu, size_t offer_pdu_l
 	tlv_type = ntohs(*((uint16_t *)(pdu + tlv_boundary_offset)));
 	tlv_len  = ntohs(*((uint16_t *)(pdu + tlv_boundary_offset + sizeof(uint16_t))));
 
-	/* check remaining header */
+	/* iterate over all TLVs */
 	while (tlv_boundary_offset < offer_pdu_len) {
 
 		/* a TLV is at least 4 byte long (NOOP TLV)
@@ -1271,39 +1277,70 @@ static int srv_tx_offer_pdu(struct ctx *ctx, int fd)
 	return SUCCESS;
 }
 
+static int srv_destruct_request_pdu(struct ctx *ctx,
+		const struct request_pdu_hdr *hdr, size_t len)
+{
+
+	/* sanity checks first */
+	if (hdr->magic != htons(OFFER_PDU_MAGIC)) {
+		pr_debug("destruct request mismatch for magic");
+		return FAILURE;
+	}
+
+	if (ntohs(hdr->cookie) != ctx->srv_state.cookie) {
+		pr_debug("destruct request mismatch for cookie");
+		return FAILURE;
+	}
+
+	if (ntohs(hdr->opcode) != OPCODE_REQUEST) {
+		pr_debug("destruct request mismatch for opcode");
+		return FAILURE;
+	}
+
+	if (ntohs(hdr->len) != len) {
+		pr_debug("destruct request mismatch for len");
+		return FAILURE;
+	}
+
+	/* save client side TCP port */
+	ctx->srv_cl_request_info.port = ntohs(hdr->port);
+
+	return SUCCESS;
+}
+
 #define	RX_BUF 1024
 
-static int srv_try_rx_client_pdu(struct ctx *ctx, int pfd)
+static int srv_try_rx_client_request_pdu(struct ctx *ctx, int pfd)
 {
-	ssize_t ret;
+	ssize_t sret; int ret;
 	struct sockaddr_storage ss;
 	socklen_t ss_len = sizeof(ss);
 	struct request_pdu_hdr *request_pdu_hdr;
 	unsigned char rx_buf[RX_BUF];
 
-	ret = recvfrom(pfd, rx_buf, RX_BUF, 0, (struct sockaddr *)&ss, &ss_len);
-	if (ret < 0 && !(errno == EWOULDBLOCK)) {
+	sret = recvfrom(pfd, rx_buf, RX_BUF, 0, (struct sockaddr *)&ss, &ss_len);
+	if (sret < 0 && !(errno == EWOULDBLOCK)) {
 		err_sys_die(EXIT_FAILNET, "failed to read()");
 	}
 
-	if (ret != sizeof(struct request_pdu_hdr)) {
+	if (sret != sizeof(struct request_pdu_hdr)) {
 		pr_debug("received a invalid client request:"
 				" is %d byte but should %d byte, ignoring it",
-				ret, sizeof(struct request_pdu_hdr));
+				sret, sizeof(struct request_pdu_hdr));
 		return FAILURE;
 	}
-
-	request_pdu_hdr = (struct request_pdu_hdr *)rx_buf;
-
 
 	/* save client address */
 	ctx->srv_cl_addr_info.ss_len = ss_len;
 	memcpy(&ctx->srv_cl_addr_info.ss, &ss,
 			sizeof(ctx->srv_cl_addr_info.ss));
 
-	/* save & convert message into host byte order */
-	ctx->srv_cl_request_info.port = htons(request_pdu_hdr->port);
-
+	request_pdu_hdr = (struct request_pdu_hdr *)rx_buf;
+	ret = srv_destruct_request_pdu(ctx, request_pdu_hdr, sret);
+	if (ret != SUCCESS) {
+		err_msg("relieved REQUEST packet does not match our exception, ignoring");
+		return FAILURE;
+	}
 
 	pr_debug("client requested to open a new TCP data socket on port %u",
 			  ctx->srv_cl_request_info.port);
@@ -1312,7 +1349,7 @@ static int srv_try_rx_client_pdu(struct ctx *ctx, int pfd)
 }
 
 
-static ssize_t xsendfile(struct ctx *ctx, int connected_fd, int file_fd)
+static int xsendfile(struct ctx *ctx, int connected_fd, int file_fd)
 {
 	ssize_t rc, write_cnt;
 	off_t offset = 0, filesize;
@@ -1328,6 +1365,7 @@ static ssize_t xsendfile(struct ctx *ctx, int connected_fd, int file_fd)
 			err_sys_die(EXIT_FAILNET, "Failure in sendfile routine");
 		tx_calls++;
 	}
+	/* FIXME: this is crap */
 	/* and write remaining bytes, if any */
 	write_cnt = filesize - offset - 1;
 	if (write_cnt >= 0) {
@@ -1337,16 +1375,16 @@ static ssize_t xsendfile(struct ctx *ctx, int connected_fd, int file_fd)
 		 tx_calls++;
 	}
 
-	if (offset != filesize)
-		err_msg_die(EXIT_FAILNET,
-				"Incomplete transfer from sendfile: %d of %ld bytes",
-				offset , filesize);
+	if (offset != filesize) {
+		return FAILURE;
+	}
 
 	pr_debug("transmitted %d bytes with %d calls via sendfile()",
 			 filesize, tx_calls);
 
-	return rc;
+	return SUCCESS;
 }
+
 
 static int srv_open_active_connection(struct ctx *ctx, const char *hostname)
 {
@@ -1397,6 +1435,7 @@ static int srv_open_active_connection(struct ctx *ctx, const char *hostname)
 	return fd;
 }
 
+
 /* FIXME: print_pretty_size_double() and print_pretty_size() should
  * be united via an additional format string argument. Another solution
  * is the outsource[TM] the common parts and group then in a value return
@@ -1426,9 +1465,10 @@ static void print_pretty_size_double(FILE *fd, double size, const char *trail)
 	fprintf(fd, "%.2lf %s%s", pretty_filesize, prefix, trail);
 }
 
+
 static void srv_tx_file(struct ctx *ctx)
 {
-	int file_fd, net_fd;
+	int file_fd, net_fd, ret;
 	char peer[NI_MAXHOST];
 	struct timeval tv_start, tv_end, tv_res;
 	double goodput;
@@ -1453,7 +1493,11 @@ static void srv_tx_file(struct ctx *ctx)
 
 	/* finally sent the file to the peer */
 	gettimeofday(&tv_start, NULL);
-	xsendfile(ctx, net_fd, file_fd);
+	ret = xsendfile(ctx, net_fd, file_fd);
+	if (ret != SUCCESS) {
+		err_msg("\nfailure in file transmit for client, skipping this request");
+		goto out;
+	}
 	gettimeofday(&tv_end, NULL);
 
 	/* calculate diff */
@@ -1467,6 +1511,7 @@ static void srv_tx_file(struct ctx *ctx)
 
 	ctx->srv_state.no_query++;
 
+out:
 	close(net_fd);
 	close(file_fd);
 }
@@ -1514,7 +1559,6 @@ static void print_pretty_size(FILE *fd, off_t size)
 }
 
 
-
 /* In server mode the program sends in regular interval
  * a UDP offer PDU to a well known multicast address.
  * If a client want to receive this data the client opens
@@ -1558,7 +1602,7 @@ int server_mode(struct ctx *ctx)
 		}
 
 		while (666) { /* handle all backloged client requests */
-			ret = srv_try_rx_client_pdu(ctx, pfd);
+			ret = srv_try_rx_client_request_pdu(ctx, pfd);
 			if (ret != SUCCESS)
 				break;
 
@@ -1578,7 +1622,8 @@ int server_mode(struct ctx *ctx)
 	return EXIT_SUCCESS;
 }
 
-static void cl_print_srv_offer(const struct ctx *ctx)
+
+static void cli_print_srv_offer(const struct ctx *ctx)
 {
 	const uint32_t filesize = ctx->cl_offer_info.file_size;
 	const char *prefix;
@@ -1612,8 +1657,7 @@ static void cl_print_srv_offer(const struct ctx *ctx)
 }
 
 
-
-static int client_try_read_offer_pdu(struct ctx *ctx, int pfd)
+static int cli_read_srv_offer_pdu(struct ctx *ctx, int pfd)
 {
 	ssize_t ret;
 	char rx_buf[RX_BUF];
@@ -1635,7 +1679,7 @@ static int client_try_read_offer_pdu(struct ctx *ctx, int pfd)
 		return FAILURE;
 	}
 
-	cl_print_srv_offer(ctx);
+	cli_print_srv_offer(ctx);
 
 	return SUCCESS;
 }
@@ -1645,6 +1689,7 @@ static uint16_t dice_a_port(void)
 {
 	return (random() % (EPHEMERAL_PORT_MAX - EPHEMERAL_PORT_MIN)) + EPHEMERAL_PORT_MIN;
 }
+
 
 static int cli_open_stream_sink(uint16_t *port, int *lfd)
 {
@@ -1709,16 +1754,25 @@ static int cli_open_stream_sink(uint16_t *port, int *lfd)
 }
 
 
-static int cli_inform_server(const struct ctx *ctx, int afd, uint16_t port)
+static void cli_construct_request_pdu(const struct ctx *ctx,
+		struct request_pdu_hdr *hdr, const uint16_t port)
+{
+	memset(hdr, 0, sizeof(*hdr));
+
+	hdr->magic  = htons(OFFER_PDU_MAGIC);
+	hdr->cookie = htons(ctx->cli_state.cookie);
+	hdr->opcode = htons(OPCODE_REQUEST);
+	hdr->len    = htons(sizeof(*hdr));
+	hdr->port   = htons(port);
+}
+
+
+static int cli_tx_request_pdu(const struct ctx *ctx, int afd, uint16_t port)
 {
 	ssize_t ret;
 	struct request_pdu_hdr request_pdu_hdr;
 
-	(void) ctx;
-
-	memset(&request_pdu_hdr, 0, sizeof(request_pdu_hdr));
-
-	request_pdu_hdr.port = htons(port);
+	cli_construct_request_pdu(ctx, &request_pdu_hdr, port);
 
 	/* send a message to ctx->cl_srv_addr_info.ss */
 	ret = write(afd, &request_pdu_hdr, sizeof(request_pdu_hdr));
@@ -1728,6 +1782,7 @@ static int cli_inform_server(const struct ctx *ctx, int afd, uint16_t port)
 
 	return SUCCESS;
 }
+
 
 static int cli_wait_for_accept(int fd)
 {
@@ -1748,6 +1803,7 @@ static int cli_wait_for_accept(int fd)
 
 	return connected_fd;
 }
+
 
 static int cli_read_and_save_file(struct ctx *ctx, int fd)
 {
@@ -1821,7 +1877,7 @@ static int cli_rx_file(struct ctx *ctx, int afd)
 	}
 
 	/* inform the server about the newly created connection */
-	ret = cli_inform_server(ctx, afd, port);
+	ret = cli_tx_request_pdu(ctx, afd, port);
 	if (ret != SUCCESS) {
 		err_msg_die(EXIT_FAILNET, "Can't inform the server, upps!");
 	}
@@ -1839,6 +1895,7 @@ static int cli_rx_file(struct ctx *ctx, int afd)
 	return EXIT_SUCCESS;
 }
 
+
 static int cli_open_file_sink(struct ctx *ctx)
 {
 	int ret;
@@ -1848,10 +1905,11 @@ static int cli_open_file_sink(struct ctx *ctx)
 	mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP;
 
 	if (force_new_filename) {
-		/* regardless if the file is already present, we
-		 * will overide the old content whitout any warning
-		 * message. If the user use the "-o" option then
-		 * he is a professional user[TM] */
+		/* if force_new_filename is true if the user gave the
+		 * -o <filename> argument. Regardless if the file is
+		 * already present, we will overide the old content
+		 * whitout any warning message. If the user use the
+		 * "-o" option then he is a professional user[TM] */
 		ctx->cl_file_hndl.fd = open(force_new_filename, O_WRONLY | O_CREAT, mode);
 		if (ctx->cl_file_hndl.fd < 0) {
 			err_sys_die(EXIT_FAILFILE, "Cannot open file %s for writing",
@@ -1866,7 +1924,7 @@ static int cli_open_file_sink(struct ctx *ctx)
 	if (ret == 0)
 		err_msg_die(EXIT_FAILMISC, "remote file \"%s\" already present!"
 				" Please rename the old file or use the option -o"
-				" <out-filename to specify an alternative filename",
+				" <out-filename> to specify an alternative filename",
 				remote_filename);
 
 	ctx->cl_file_hndl.fd = open(remote_filename, O_WRONLY | O_CREAT | O_EXCL, mode);
@@ -1890,6 +1948,8 @@ int client_mode(struct ctx *ctx)
 
 	fprintf(stderr, "netpp operating in passive mode\n");
 
+	/* both sockets are used to exchange control information
+	 * with the server */
 	pfd = init_passive_socket(DEFAULT_V4_MULT_ADDR, port, must_block);
 	afd = init_active_socket(DEFAULT_V4_MULT_ADDR, port);
 
@@ -1897,12 +1957,12 @@ int client_mode(struct ctx *ctx)
 		pr_debug("wait to receive a valid offer message from a server");
 
 		/* block until we receive a offer pdu */
-		ret = client_try_read_offer_pdu(ctx, pfd);
+		ret = cli_read_srv_offer_pdu(ctx, pfd);
 		if (ret != SUCCESS)
-			continue;
+			continue; /* something wrong with the packet */
 
 		/* fine, we received a valid offer! We will
-		 * now open a passice TCP socket, announce this
+		 * now open a passive TCP socket, announce this
 		 * port to the server and wait for the file from
 		 * the server. But first we will open the filesink
 		 * where we store the new data */
@@ -1933,6 +1993,7 @@ struct ctx *init_ctx(void)
 
 	return ctx;
 }
+
 
 /* FIXME: call me! */
 void free_ctx(struct ctx *c)
