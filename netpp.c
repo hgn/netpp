@@ -1,5 +1,5 @@
 /*
-** Copyright (C) 2009 - Hagen Paul Pfeifer <hagen@jauu.net>
+** Copyright (C) 2009,2010 - Hagen Paul Pfeifer <hagen@jauu.net>
 **
 ** This program is free software; you can redistribute it and/or modify
 ** it under the terms of the GNU General Public License as published by
@@ -266,6 +266,10 @@ struct srv_state {
 	unsigned long no_query;
 };
 
+struct cli_state {
+	uint16_t cookie;
+};
+
 struct ctx {
 	int mode;
 	struct opts *opts;
@@ -275,6 +279,7 @@ struct ctx {
 	struct cl_file_hndl cl_file_hndl;
 	/* server stuff */
 	struct srv_state srv_state;
+	struct cli_state cli_state;
 	struct srv_cl_request_info srv_cl_request_info;
 	struct srv_cl_addr_info srv_cl_addr_info;
 	struct srv_file_hndl srv_file_hndl;
@@ -474,8 +479,10 @@ struct progress {
 	struct throughput *throughput;
 };
 
+
 static struct progress *progress;
 static volatile int progress_update;
+
 
 static void progress_interval(int signum __attribute__((unused)))
 {
@@ -757,6 +764,7 @@ static void xgetaddrinfo(const char *node, const char *service,
 	return;
 }
 
+
 static void xgetnameinfo(const struct sockaddr *sa, socklen_t salen,
 		char *host, size_t hostlen,
 		char *serv, size_t servlen, int flags)
@@ -768,6 +776,7 @@ static void xgetnameinfo(const struct sockaddr *sa, socklen_t salen,
 
 	}
 }
+
 
 static void usage(const char *me)
 {
@@ -870,7 +879,8 @@ static int set_non_blocking(int fd)
 }
 
 
-int init_passive_socket(const char *addr, const char *port, int must_block)
+static int init_passive_socket(const char *addr,
+		const char *port, int must_block)
 {
 	int fd = -1;
 	struct addrinfo hosthints, *hostres, *addrtmp;
@@ -915,6 +925,7 @@ int init_passive_socket(const char *addr, const char *port, int must_block)
 	return fd;
 }
 
+
 static int xopen(const char *file)
 {
 	int fd;
@@ -927,6 +938,7 @@ static int xopen(const char *file)
 
 	return fd;
 }
+
 
 static int srv_init_file_hndl(struct ctx *ctx)
 {
@@ -951,6 +963,7 @@ static int srv_init_file_hndl(struct ctx *ctx)
 	return SUCCESS;
 }
 
+
 /* serveral operations are done of the open fd
  * There are several possibilities like seek(fd) to
  * the beginning to the file or: close and reopen
@@ -960,6 +973,7 @@ static void srv_reopen_file(struct ctx *ctx)
 	close(ctx->srv_file_hndl.fd);
 	ctx->srv_file_hndl.fd = xopen(ctx->srv_file_hndl.name);
 }
+
 
 static int init_active_socket(const char *addr, const char *port)
 {
@@ -976,7 +990,7 @@ static int init_active_socket(const char *addr, const char *port)
 		return 1;
 	}
 
-	for (res=res0; res!=NULL; res=res->ai_next) {
+	for (res = res0; res != NULL; res = res->ai_next) {
 		sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
 		if (sock < 0) {
 			continue;
@@ -991,10 +1005,7 @@ static int init_active_socket(const char *addr, const char *port)
 	}
 
 	if (res == NULL) {
-		/* could not create a valid connection */
-		fprintf(stderr, "failed\n");
-
-		return 1;
+		err_msg_die(EXIT_FAILNET, "failed to create a valied connection");
 	}
 
 	freeaddrinfo(res0);
@@ -1013,73 +1024,123 @@ static char *xstrdup(const char *s)
 }
 
 
-#define	TLV_SKIPN(p, n) do { p += n; } while (0)
-#define	TLV_SKIP2(p) TLV_SKIPN(p, 2)
-#define	TLV_SKIP4(p) TLV_SKIPN(p, 4)
-
-#define	TLV_WRITE2(p, n) do { *(int16_t *)p = n; TLV_SKIP2(p); } while (0)
-#define	TLV_WRITE4(p, n) do { *(int32_t *)p = n; TLV_SKIP4(p); } while (0)
-
-#define	TLV_READ2(p, n) do { n = *(int16_t *)p; TLV_SKIP2(p); } while (0)
-#define	TLV_READ4(p, n) do { n = *(int32_t *)p; TLV_SKIP4(p); } while (0)
-
-static int decode_offer_pdu(struct ctx *ctx, char *pdu, size_t pdu_len)
+static int cli_destruct_offer_pdu_hdr(struct ctx *ctx,
+		struct offer_pdu_hdr *hdr, ssize_t len)
 {
-	uint32_t tmp;
-	char *ptr = pdu;
-	struct cl_offer_info *cl_offer_info = &ctx->cl_offer_info;
-
-	if (pdu_len < 4 + 4 + 1) {
-		pr_debug("offered file should be at least one character in name");
+	if (len < (ssize_t)sizeof(*hdr))
 		return FAILURE;
-	}
 
-	TLV_READ4(ptr, tmp);
-	cl_offer_info->file_size = ntohl(tmp);
-
-	TLV_READ4(ptr, tmp);
-	cl_offer_info->filename_len = ntohl(tmp);
-
-	if (pdu_len < 4 + 4 + cl_offer_info->filename_len) {
-		pr_debug("offered filename is %u bytes but transmitted only %u",
-				  cl_offer_info->filename_len, pdu_len - 4 - 4);
+	if (ntohs(hdr->magic) != OFFER_PDU_MAGIC)
 		return FAILURE;
-	}
 
-	pr_debug("offered file \"%s\", filesize: %u bytes",
-			ptr, cl_offer_info->file_size);
+	if (ntohs(hdr->opcode) != OPCODE_OFFER)
+		return FAILURE;
 
-	cl_offer_info->filename = xstrdup(ptr);
+	if (ntohs(hdr->len) != len)
+		return FAILURE;
+
+	ctx->cli_state.cookie = ntohs(hdr->cookie);
 
 	return SUCCESS;
 }
 
 
-static size_t encode_offer_pdu(struct ctx *ctx, unsigned char *pdu, size_t max_pdu_len)
+static int cli_destruct_offer_pdu_tlv_file(struct ctx *ctx,
+		struct offer_pdu_tlv_file *hdr)
 {
-	unsigned char *ptr = pdu;
-	size_t len = 0;
-	const char *filename = ctx->srv_file_hndl.name;
+	struct cl_offer_info *cl_offer_info = &ctx->cl_offer_info;
+
+	cl_offer_info->file_size    = ntohl(hdr->filesize);
+	cl_offer_info->filename_len = ntohl(hdr->filename_len);
+
+	/* FIXME: sanity checks */
+
+	cl_offer_info->filename = xstrdup(hdr->filename);
+
+	return SUCCESS;
+}
 
 
-	TLV_WRITE4(ptr, htonl(ctx->srv_file_hndl.filesize));
-	len += 4;
+static int cli_destruct_offer_pdu_tlv_sha1(struct ctx *ctx,
+		struct offer_pdu_tlv_sha1 *hdr)
+{
+	(void) ctx;
+	(void) hdr;
 
-	TLV_WRITE4(ptr, htonl(strlen(filename) + 1));
-	len += 4;
+	return SUCCESS;
+}
 
-	if (strlen(filename) + 1 >= max_pdu_len - len) {
-		err_msg_die(EXIT_FAILINT, "remaining buffer (%d byte) to small to "
-				"transmit filename (%d byte)!",
-				max_pdu_len - len, strlen(filename));
+static int cli_destruct_offer_pdu(struct ctx *ctx, char *pdu, size_t offer_pdu_len)
+{
+	int ret;
+	uint16_t tlv_type, tlv_len;
+	size_t tlv_boundary_offset;
+
+	/* check common header */
+	ret = cli_destruct_offer_pdu_hdr(ctx, (struct offer_pdu_hdr *)pdu, offer_pdu_len);
+	if (ret != SUCCESS) {
+		err_msg("failure in destruct common PDU header");
+		return FAILURE;
 	}
 
-	memcpy(ptr, filename, strlen(filename) + 1);
+	tlv_boundary_offset = sizeof(struct offer_pdu_hdr);
 
-	len += strlen(filename) + 1;
+	tlv_type = ntohs(*((uint16_t *)(pdu + tlv_boundary_offset)));
+	tlv_len  = ntohs(*((uint16_t *)(pdu + tlv_boundary_offset + sizeof(uint16_t))));
 
-	return len;
+	/* check remaining header */
+	while (tlv_boundary_offset < offer_pdu_len) {
+
+		/* a TLV is at least 4 byte long (NOOP TLV)
+		 * and has a length of a multiple of 4 byte */
+		if ((tlv_len < 4) && (tlv_len % 4 == 0)) {
+			err_msg("failure in TLV offer PDU");
+			return FAILURE;
+		}
+
+		switch (tlv_type) {
+			case OFFER_TLV_FILE:
+				pr_debug("found OFFER_TLV_FILE");
+				ret = cli_destruct_offer_pdu_tlv_file(ctx,
+						(struct offer_pdu_tlv_file *)(pdu + tlv_boundary_offset));
+				if (ret != SUCCESS) {
+					err_msg("failure in received OFFER PDU (OFFER_TLV_FILE)");
+					return FAILURE;
+				}
+
+				break;
+			case OFFER_TLV_SHA1:
+				pr_debug("found OFFER_TLV_FILE");
+				ret = cli_destruct_offer_pdu_tlv_sha1(ctx,
+						(struct offer_pdu_tlv_sha1 *)(pdu + tlv_boundary_offset));
+				if (ret != SUCCESS) {
+					err_msg("failure in received OFFER PDU (OFFER_TLV_SHA1)");
+					return FAILURE;
+				}
+
+				break;
+			default: /* ignore unknown type */
+				pr_debug("unknown OFFER_TLV (type: %u, len: %u), skipping",
+						tlv_type, tlv_len);
+				break;
+		}
+
+		tlv_boundary_offset += tlv_len;
+		if (tlv_boundary_offset + 4 > offer_pdu_len) {
+			break;
+		}
+		tlv_type = ntohs(*((uint16_t *)(pdu + tlv_boundary_offset)));
+		tlv_len  = ntohs(*((uint16_t *)(pdu + tlv_boundary_offset + sizeof(uint16_t))));
+	}
+
+	if (tlv_boundary_offset - offer_pdu_len != 0) {
+		err_msg("received corrupt OFFER PDU - ignoring it");
+		return FAILURE;
+	}
+
+	return SUCCESS;
 }
+
 
 static size_t srv_construct_offer_pdu_hdr(struct ctx *ctx,
 		struct offer_pdu_hdr *hdr, size_t len)
@@ -1091,9 +1152,10 @@ static size_t srv_construct_offer_pdu_hdr(struct ctx *ctx,
 	hdr->opcode = htons(OPCODE_OFFER);
 	hdr->len    = htons(len);
 
-	/* constant header len */
+	/* standard header is always constat in len */
 	return sizeof(*hdr);
 }
+
 
 static size_t srv_construct_offer_pdu_tlv_file(struct ctx *ctx,
 		struct offer_pdu_tlv_file *hdr, size_t filename_len,
@@ -1116,13 +1178,16 @@ static size_t srv_construct_offer_pdu_tlv_file(struct ctx *ctx,
 
 
 static size_t srv_construct_offer_pdu_tlv_sha1(struct ctx *ctx,
-		struct offer_pdu_tlv_sha1 *offer_pdu_tlv_sha1)
+		struct offer_pdu_tlv_sha1 *hdr)
 {
-	(void) ctx;
+	unsigned len = sizeof(*hdr);
 
-	memset(offer_pdu_tlv_sha1, 0, sizeof(*offer_pdu_tlv_sha1));
+	(void)ctx;
 
-	return sizeof(*offer_pdu_tlv_sha1);
+	hdr->type = htons(OFFER_TLV_SHA1);
+	hdr->len  = htons(len);
+
+	return len;
 }
 
 
@@ -1143,7 +1208,7 @@ static size_t srv_construct_offer_pdu(struct ctx *ctx)
 		return FAILURE;
 	}
 
-	/* standard header size */
+	/* calculate the len of a standard offer pdu header */
 	pdu_len  = sizeof(struct offer_pdu_hdr);
 	pdu_len += sizeof(struct offer_pdu_tlv_file);
 
@@ -1169,12 +1234,12 @@ static size_t srv_construct_offer_pdu(struct ctx *ctx)
 	offset = srv_construct_offer_pdu_hdr(ctx,
 			(struct offer_pdu_hdr *)pdu, pdu_len);
 
-	offer_pdu_tlv_file = (struct offer_pdu_tlv_file *)pdu + offset;
+	offer_pdu_tlv_file = (struct offer_pdu_tlv_file *)(pdu + offset);
 	offset += srv_construct_offer_pdu_tlv_file(ctx, offer_pdu_tlv_file,
 			filename_len, pdu_padding);
 
 	if (ctx->opts->features & SHA1_CHECK_MASK) {
-		offer_pdu_tlv_sha1 = (struct offer_pdu_tlv_sha1 *)pdu + offset;
+		offer_pdu_tlv_sha1 = (struct offer_pdu_tlv_sha1 *)(pdu + offset);
 		offset += srv_construct_offer_pdu_tlv_sha1(ctx,
 				offer_pdu_tlv_sha1);
 	}
@@ -1194,14 +1259,11 @@ static size_t srv_construct_offer_pdu(struct ctx *ctx)
 
 static int srv_tx_offer_pdu(struct ctx *ctx, int fd)
 {
-	ssize_t ret; size_t len;
-	unsigned char buf[OFFER_PDU_LEN_MAX];
+	ssize_t ret;
+	struct srv_state *srv_state = &ctx->srv_state;
 
-	memset(buf, 0, sizeof(buf));
-
-	len = encode_offer_pdu(ctx, buf, OFFER_PDU_LEN_MAX);
-
-	ret = write(fd, buf, len);
+	/* FIXME: short write */
+	ret = write(fd, srv_state->offer_pdu, srv_state->offer_pdu_len);
 	if (ret == -1 && !(errno == EWOULDBLOCK)) {
 		err_sys_die(EXIT_FAILNET, "Cannot send offer message");
 	}
@@ -1209,7 +1271,7 @@ static int srv_tx_offer_pdu(struct ctx *ctx, int fd)
 	return SUCCESS;
 }
 
-#define	RX_BUF 512
+#define	RX_BUF 1024
 
 static int srv_try_rx_client_pdu(struct ctx *ctx, int pfd)
 {
@@ -1550,6 +1612,7 @@ static void cl_print_srv_offer(const struct ctx *ctx)
 }
 
 
+
 static int client_try_read_offer_pdu(struct ctx *ctx, int pfd)
 {
 	ssize_t ret;
@@ -1566,7 +1629,7 @@ static int client_try_read_offer_pdu(struct ctx *ctx, int pfd)
 
 	pr_debug("received %u byte from server", ret);
 
-	ret = decode_offer_pdu(ctx, rx_buf, ret);
+	ret = cli_destruct_offer_pdu(ctx, rx_buf, ret);
 	if (ret != SUCCESS) {
 		pr_debug("server offer pdu does not match our exception, igoring it");
 		return FAILURE;
