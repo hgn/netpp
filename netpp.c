@@ -88,6 +88,11 @@
 # define ULLONG_MAX 18446744073709551615ULL
 #endif
 
+/* st_blksize via fstat(2) can[TM] be superior */
+#ifndef BUFSIZ
+# define BUFSIZ 8192
+#endif
+
 #define min(x,y) ({                     \
         typeof(x) _x = (x);             \
         typeof(y) _y = (y);             \
@@ -202,7 +207,7 @@ struct offer_pdu_tlv_file {
 struct offer_pdu_tlv_sha1 {
 	uint16_t type;
 	uint16_t len;
-	char digest[SHA_DIGEST_LENGTH];
+	unsigned char digest[SHA_DIGEST_LENGTH];
 };
 
 /* this message is sent from the client to the
@@ -269,6 +274,7 @@ struct srv_state {
 	char *offer_pdu;
 	size_t offer_pdu_len;
 	unsigned long no_query;
+	unsigned char sha1_digest[SHA_DIGEST_LENGTH]
 };
 
 struct cli_state {
@@ -1183,15 +1189,17 @@ static size_t srv_construct_offer_pdu_tlv_file(struct ctx *ctx,
 }
 
 
-static size_t srv_construct_offer_pdu_tlv_sha1(struct ctx *ctx,
+static size_t srv_construct_offer_pdu_tlv_sha1(
+		struct ctx *ctx __attribute__((unused)),
 		struct offer_pdu_tlv_sha1 *hdr)
 {
 	unsigned len = sizeof(*hdr);
 
-	(void)ctx;
-
 	hdr->type = htons(OFFER_TLV_SHA1);
 	hdr->len  = htons(len);
+
+	/* copy the previously calculated SHA1 digest */
+	memcpy(&hdr->digest, &ctx->srv_state.sha1_digest, sizeof(hdr->digest));
 
 	return len;
 }
@@ -1558,6 +1566,55 @@ static void print_pretty_size(FILE *fd, off_t size)
 	fprintf(fd, "%.2lf %s", pretty_filesize, prefix);
 }
 
+static int srv_calc_sha1_for_file(struct ctx *ctx)
+{
+	int fd;
+	unsigned long rx_calls, rx_bytes, chunks;
+	int ret, buflen = BUFSIZ;
+	unsigned int i = 1;
+	unsigned int md_len;
+	ssize_t rc;
+	char buf[BUFSIZ];
+	EVP_MD_CTX mdctx;
+	const EVP_MD *md;
+	unsigned char md_value[SHA_DIGEST_LENGTH];
+
+	rx_calls = rx_bytes = 0;
+
+	md = EVP_sha1();
+	if(!md) {
+		err_msg_die(EXIT_FAILMISC, "Cannot initialize SHA1 structures from openssl");
+		// FIXME: return failure and disable sha1 feature
+	}
+
+	EVP_MD_CTX_init(&mdctx);
+	EVP_DigestInit_ex(&mdctx, md, NULL);
+
+	fd = ctx->srv_file_hndl.fd;
+
+	fprintf(stderr, "calculating SHA1 digest for file, ...");
+
+	while ((rc = read(fd, buf, buflen)) > 0) {
+
+		// FIXME: catch failure for ssl stuff
+		EVP_DigestUpdate(&mdctx, buf, rc);
+
+		display_progress(progress, i++);
+	}
+
+	EVP_DigestFinal_ex(&mdctx, ctx->srv_state.sha1_digest, &md_len);
+	EVP_MD_CTX_cleanup(&mdctx);
+
+	fprintf(stderr, "\rcalculating SHA1 digest for file, done (");
+	for(i = 0; i < md_len; i++)
+		fprintf(stderr, "%02x", ctx->srv_state.sha1_digest[i]);
+	fprintf(stderr, ")\n");
+
+	srv_reopen_file(ctx);
+
+	return SUCCESS;
+}
+
 
 /* In server mode the program sends in regular interval
  * a UDP offer PDU to a well known multicast address.
@@ -1584,15 +1641,24 @@ int server_mode(struct ctx *ctx)
 	pfd = init_passive_socket(DEFAULT_V4_MULT_ADDR, port, must_block);
 	afd = init_active_socket(DEFAULT_V4_MULT_ADDR, port);
 
-	fprintf(stderr, "netpp operating in active mode (filename: %s, size: ",
+	fprintf(stderr, "netpp operating in serving mode (filename: %s, size: ",
 			filename);
 	print_pretty_size(stderr, ctx->srv_file_hndl.filesize);
 	fprintf(stderr, ")\n");
+
+	if (ctx->opts->features & SHA1_CHECK_MASK) {
+		ret = srv_calc_sha1_for_file(ctx);
+		if (ret != SUCCESS) {
+			err_msg_die(EXIT_FAILFILE, "Failed to calculate SHA1 sum for file");
+		}
+	}
 
 	ret = srv_construct_offer_pdu(ctx);
 	if (ret != SUCCESS) {
 		err_msg_die(EXIT_FAILNET, "Failure in Offer-PDU message generation");
 	}
+
+	fprintf(stderr, "waiting for file queries\n");
 
 	while (23) {
 

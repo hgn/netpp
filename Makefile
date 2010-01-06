@@ -3,7 +3,7 @@ DEBUG_BUILD := testing
 OBJ := netpp.o
 TARGET := netpp
 
-LIBS   := -lrt  # for clock_gettime(2)
+LIBS   := -lrt -lssl
 
 CFLAGS := -Wall -Wextra -pipe -Wwrite-strings -Wsign-compare \
 					-Wshadow -Wformat=2 -Wundef -Wstrict-prototypes   \
