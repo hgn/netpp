@@ -88,7 +88,8 @@
 # define ULLONG_MAX 18446744073709551615ULL
 #endif
 
-/* st_blksize via fstat(2) can[TM] be superior */
+/* 7.19.1 in C99 but anyway: 8K or 16K on most
+ * machines - st_blksize via fstat(2) can[TM] be superior */
 #ifndef BUFSIZ
 # define BUFSIZ 8192
 #endif
@@ -274,11 +275,12 @@ struct srv_state {
 	char *offer_pdu;
 	size_t offer_pdu_len;
 	unsigned long no_query;
-	unsigned char sha1_digest[SHA_DIGEST_LENGTH]
+	unsigned char sha1_digest[SHA_DIGEST_LENGTH];
 };
 
 struct cli_state {
 	uint16_t cookie;
+	unsigned char sha1_digest[SHA_DIGEST_LENGTH];
 };
 
 struct ctx {
@@ -295,6 +297,7 @@ struct ctx {
 	struct srv_cl_addr_info srv_cl_addr_info;
 	struct srv_file_hndl srv_file_hndl;
 };
+
 
 static int subtime(struct timeval *op1, struct timeval *op2,
 				   struct timeval *result)
@@ -319,6 +322,7 @@ static int subtime(struct timeval *op1, struct timeval *op2,
 
 	return sign;
 }
+
 
 static double tv_to_sec(struct timeval *tv)
 {
@@ -500,6 +504,7 @@ static void progress_interval(int signum __attribute__((unused)))
 	progress_update = 1;
 }
 
+
 static void set_progress_signal(void)
 {
 	struct sigaction sa;
@@ -519,6 +524,7 @@ static void set_progress_signal(void)
 	setitimer(ITIMER_REAL, &v, NULL);
 }
 
+
 static void clear_progress_signal(void)
 {
 	struct itimerval v;
@@ -530,6 +536,7 @@ static void clear_progress_signal(void)
 
 	progress_update = 0;
 }
+
 
 static int display(struct progress *progress, unsigned n, const char *done)
 {
@@ -574,6 +581,7 @@ static int display(struct progress *progress, unsigned n, const char *done)
 	return 0;
 }
 
+
 static void throughput_string(struct throughput *tp, off_t total,
 			      unsigned int rate)
 {
@@ -603,6 +611,7 @@ static void throughput_string(struct throughput *tp, off_t total,
 		snprintf(tp->display + sizeof(tp->display) - l, l,
 			 " | %u KiB/s", rate);
 }
+
 
 void display_throughput(struct progress *progress, off_t total)
 {
@@ -791,7 +800,7 @@ static void xgetnameinfo(const struct sockaddr *sa, socklen_t salen,
 
 static void usage(const char *me)
 {
-	fprintf(stderr,
+	fprintf(stdout,
 			"%s (-4|-6) (-b <rx-buffer-size>) "
 			"(-p <port>) (-o <output-filename>)"
 			"[filename]\n",
@@ -1541,6 +1550,7 @@ static int srv_init_state(struct ctx *ctx)
 	return SUCCESS;
 }
 
+
 static void print_pretty_size(FILE *fd, off_t size)
 {
 	double pretty_filesize;
@@ -1565,6 +1575,7 @@ static void print_pretty_size(FILE *fd, off_t size)
 
 	fprintf(fd, "%.2lf %s", pretty_filesize, prefix);
 }
+
 
 static int srv_calc_sha1_for_file(struct ctx *ctx)
 {
