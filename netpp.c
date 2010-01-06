@@ -15,6 +15,10 @@
 ** along with this program; if not, write to the Free Software
 ** Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
+
+#define _LARGEFILE64_SOURCE
+#define _FILE_OFFSET_BITS 64
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -1084,8 +1088,10 @@ static int cli_destruct_offer_pdu_tlv_file(struct ctx *ctx,
 static int cli_destruct_offer_pdu_tlv_sha1(struct ctx *ctx,
 		struct offer_pdu_tlv_sha1 *hdr)
 {
-	(void) ctx;
-	(void) hdr;
+	if (ntohs(hdr->len) != 2 + 2 + sizeof(ctx->cli_state.sha1_digest))
+		return FAILURE;
+
+	memcpy(&ctx->cli_state.sha1_digest, &hdr->digest, sizeof(ctx->cli_state.sha1_digest));
 
 	return SUCCESS;
 }
@@ -1609,8 +1615,11 @@ static int srv_calc_sha1_for_file(struct ctx *ctx)
 
 		// FIXME: catch failure for ssl stuff
 		EVP_DigestUpdate(&mdctx, buf, rc);
+	}
 
-		display_progress(progress, i++);
+	if (rc < 0) {
+		// FIXME
+		abort();
 	}
 
 	EVP_DigestFinal_ex(&mdctx, ctx->srv_state.sha1_digest, &md_len);
@@ -1882,6 +1891,63 @@ static int cli_wait_for_accept(int fd)
 }
 
 
+/* even we wrote the content to ctx->cl_file_hndl.fd
+ * we now seek to the start of the file, calculcate the
+ * sha1 digest and compare this digest with the server
+ * calculated digest */
+static void cli_validate_sha1_digest(const struct ctx *ctx)
+{
+	off64_t oret;
+	int fd, ret;
+	unsigned int i = 1, md_len;
+	ssize_t rc;
+	unsigned char buf[BUFSIZ], md_value[SHA_DIGEST_LENGTH];
+	EVP_MD_CTX mdctx;
+	const EVP_MD *md;
+
+	fd = ctx->cl_file_hndl.fd;
+
+	oret = lseek64(fd, 0, SEEK_SET);
+	if (oret != 0) {
+		err_sys("cannot seek to the start of the file, skipping integrity check");
+	}
+
+	/* intialize openssl library */
+	md = EVP_sha1();
+	if(!md) {
+		err_msg("cannot initialize SHA1 structures from openssl, skipping integrity check");
+	}
+
+	EVP_MD_CTX_init(&mdctx);
+	EVP_DigestInit_ex(&mdctx, md, NULL);
+
+	while ((rc = read(fd, buf, BUFSIZ)) > 0) {
+		// FIXME: catch failure for ssl stuff
+		EVP_DigestUpdate(&mdctx, buf, rc);
+	}
+
+	if (rc < 0) {
+		err_sys("\nfailure in read() operation for output file, skipping integrity check");
+		return;
+	}
+
+	EVP_DigestFinal_ex(&mdctx, md_value, &md_len);
+	EVP_MD_CTX_cleanup(&mdctx);
+
+#define	SHORT_SHA1_PRINT_LIMIT 5
+
+	ret = memcmp(&ctx->cli_state.sha1_digest, md_value, SHA_DIGEST_LENGTH);
+	if (!ret) {
+		fprintf(stderr, "SHA1 based integrity check: successful\n");
+	} else {
+		fprintf(stderr, "SHA1 based integrity check: FAILED\n");
+		for(i = 0; i < md_len; i++)
+			fprintf(stderr, "%02x", md_value[i]);
+		fprintf(stderr, ")\n");
+	}
+}
+
+
 static int cli_read_and_save_file(struct ctx *ctx, int fd)
 {
 	unsigned long rx_calls, rx_bytes, chunks;
@@ -1916,9 +1982,12 @@ static int cli_read_and_save_file(struct ctx *ctx, int fd)
 		}
 	}
 
-	stop_progress(&progress);
+	if (rc < 0) {
+		// FIXME
+		abort();
+	}
 
-	close(ctx->cl_file_hndl.fd);
+	stop_progress(&progress);
 
 	free(buf);
 
@@ -1926,29 +1995,14 @@ static int cli_read_and_save_file(struct ctx *ctx, int fd)
 }
 
 
-static int client_rx_file(struct ctx *ctx, int fd)
-{
-	int connected_fd;
-
-	/* block until the server connect to our socket */
-	connected_fd = cli_wait_for_accept(fd);
-
-	/* read the file from the new filedescriptor */
-	cli_read_and_save_file(ctx, connected_fd);
-
-	close(connected_fd);
-
-	return SUCCESS;
-}
-
-
 static int cli_rx_file(struct ctx *ctx, int afd)
 {
-	int ret, fd;
+	int ret, server_fd;
 	uint16_t port;
+	int connected_fd;
 
 	/* open a passive TCP socket as the file sink */
-	ret = cli_open_stream_sink(&port, &fd);
+	ret = cli_open_stream_sink(&port, &server_fd);
 	if (ret != SUCCESS) {
 		err_msg_die(EXIT_FAILNET, "Failed to create TCP socket");
 	}
@@ -1959,14 +2013,27 @@ static int cli_rx_file(struct ctx *ctx, int afd)
 		err_msg_die(EXIT_FAILNET, "Can't inform the server, upps!");
 	}
 
-	/* finally receive the file */
-	ret = client_rx_file(ctx, fd);
-	if (ret != SUCCESS) {
-		err_msg_die(EXIT_FAILNET, "Can't receive the file, strange");
+	/* block until the server connect to our socket */
+	connected_fd = cli_wait_for_accept(server_fd);
+
+	/* read the file from the new filedescriptor */
+	cli_read_and_save_file(ctx, connected_fd);
+
+	/* close recently created server and accepted
+	 * client TCP descriptors */
+	close(server_fd);
+	close(connected_fd);
+
+
+	/* validate file integrity - if desired */
+	if (ctx->opts->features & SHA1_CHECK_MASK) {
+		cli_validate_sha1_digest(ctx);
 	}
 
-	/* close recently created server port */
-	close(fd);
+	/* and close file descriptor */
+	close(ctx->cl_file_hndl.fd);
+
+
 
 	/* and exit the program gracefully */
 	return EXIT_SUCCESS;
@@ -1987,7 +2054,7 @@ static int cli_open_file_sink(struct ctx *ctx)
 		 * already present, we will overide the old content
 		 * whitout any warning message. If the user use the
 		 * "-o" option then he is a professional user[TM] */
-		ctx->cl_file_hndl.fd = open(force_new_filename, O_WRONLY | O_CREAT, mode);
+		ctx->cl_file_hndl.fd = open(force_new_filename, O_RDWR | O_CREAT, mode);
 		if (ctx->cl_file_hndl.fd < 0) {
 			err_sys_die(EXIT_FAILFILE, "Cannot open file %s for writing",
 					force_new_filename);
@@ -2004,7 +2071,7 @@ static int cli_open_file_sink(struct ctx *ctx)
 				" <out-filename> to specify an alternative filename",
 				remote_filename);
 
-	ctx->cl_file_hndl.fd = open(remote_filename, O_WRONLY | O_CREAT | O_EXCL, mode);
+	ctx->cl_file_hndl.fd = open(remote_filename, O_RDWR | O_CREAT | O_EXCL, mode);
 	if (ctx->cl_file_hndl.fd < 0) {
 		err_sys_die(EXIT_FAILFILE, "Cannot open file %s for writing",
 				force_new_filename);
