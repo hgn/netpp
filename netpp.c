@@ -124,6 +124,8 @@ static const int debug_enabled = 1;
 static const int debug_enabled = 0;
 #endif
 
+#define streq(a, b) (!strcmp((a),(b)))
+
 #define err_msg(format, args...) \
         do { \
                 x_err_ret(__FILE__, __LINE__,  format , ## args); \
@@ -802,6 +804,32 @@ static void xgetnameinfo(const struct sockaddr *sa, socklen_t salen,
 }
 
 
+static ssize_t write_len(int fd, const void *buf, size_t len)
+{
+	const char *bufptr = buf;
+	ssize_t total = 0;
+	do {
+		ssize_t written = write(fd, bufptr, len);
+		if (written < 0) {
+			int real_errno;
+
+			if (errno == EINTR || errno == EAGAIN)
+				continue;
+
+			real_errno = errno;
+			err_msg("Could not write %u bytes: %s", len, strerror(errno));
+			errno = real_errno;
+			break;
+		}
+		total += written;
+		bufptr += written;
+		len -= written;
+	} while (len > 0);
+
+	return total > 0 ? SUCCESS : FAILURE;
+}
+
+
 static void usage(const char *me)
 {
 	fprintf(stdout,
@@ -1070,14 +1098,17 @@ static int cli_destruct_offer_pdu_hdr(struct ctx *ctx,
 
 
 static int cli_destruct_offer_pdu_tlv_file(struct ctx *ctx,
-		struct offer_pdu_tlv_file *hdr)
+		struct offer_pdu_tlv_file *hdr, size_t hdr_len)
 {
 	struct cl_offer_info *cl_offer_info = &ctx->cl_offer_info;
 
 	cl_offer_info->file_size    = ntohl(hdr->filesize);
 	cl_offer_info->filename_len = ntohl(hdr->filename_len);
 
-	/* FIXME: sanity checks */
+	if (hdr_len < cl_offer_info->filename_len + 4 + 4) {
+		err_msg("the offer PDU announced a larger filename as actually transmitted");
+		return FAILURE;
+	}
 
 	cl_offer_info->filename = xstrdup(hdr->filename);
 
@@ -1088,10 +1119,13 @@ static int cli_destruct_offer_pdu_tlv_file(struct ctx *ctx,
 static int cli_destruct_offer_pdu_tlv_sha1(struct ctx *ctx,
 		struct offer_pdu_tlv_sha1 *hdr)
 {
-	if (ntohs(hdr->len) != 2 + 2 + sizeof(ctx->cli_state.sha1_digest))
+	if (ntohs(hdr->len) != 2 + 2 + sizeof(ctx->cli_state.sha1_digest)) {
+		err_msg("SHA1 TLV is currupted");
 		return FAILURE;
+	}
 
-	memcpy(&ctx->cli_state.sha1_digest, &hdr->digest, sizeof(ctx->cli_state.sha1_digest));
+	memcpy(&ctx->cli_state.sha1_digest, &hdr->digest,
+			sizeof(ctx->cli_state.sha1_digest));
 
 	return SUCCESS;
 }
@@ -1129,7 +1163,8 @@ static int cli_destruct_offer_pdu(struct ctx *ctx, char *pdu, size_t offer_pdu_l
 			case OFFER_TLV_FILE:
 				pr_debug("found OFFER_TLV_FILE");
 				ret = cli_destruct_offer_pdu_tlv_file(ctx,
-						(struct offer_pdu_tlv_file *)(pdu + tlv_boundary_offset));
+						(struct offer_pdu_tlv_file *)(pdu + tlv_boundary_offset),
+						offer_pdu_len);
 				if (ret != SUCCESS) {
 					err_msg("failure in received OFFER PDU (OFFER_TLV_FILE)");
 					return FAILURE;
@@ -1291,10 +1326,9 @@ static int srv_tx_offer_pdu(struct ctx *ctx, int fd)
 	ssize_t ret;
 	struct srv_state *srv_state = &ctx->srv_state;
 
-	/* FIXME: short write */
-	ret = write(fd, srv_state->offer_pdu, srv_state->offer_pdu_len);
-	if (ret == -1 && !(errno == EWOULDBLOCK)) {
-		err_sys_die(EXIT_FAILNET, "Cannot send offer message");
+	ret = write_len(fd, srv_state->offer_pdu, srv_state->offer_pdu_len);
+	if (ret != SUCCESS) {
+		err_msg_die(EXIT_FAILNET, "failure in OFFER PDU transmission");
 	}
 
 	return SUCCESS;
@@ -1382,28 +1416,13 @@ static int xsendfile(struct ctx *ctx, int connected_fd, int file_fd)
 
 	filesize = write_cnt = ctx->srv_file_hndl.filesize;
 
-	while (filesize - offset - 1 >= write_cnt) {
-		rc = sendfile(connected_fd, file_fd, &offset, write_cnt);
-		if (rc == -1)
-			err_sys_die(EXIT_FAILNET, "Failure in sendfile routine");
-		tx_calls++;
-	}
-	/* FIXME: this is crap */
-	/* and write remaining bytes, if any */
-	write_cnt = filesize - offset - 1;
-	if (write_cnt >= 0) {
-		rc = sendfile(connected_fd, file_fd, &offset, write_cnt + 1);
-		if (rc == -1)
-			err_sys_die(EXIT_FAILNET, "Failure in sendfile routine");
-		 tx_calls++;
+	/* XXX: handle EINTR */
+	rc = sendfile(connected_fd, file_fd, NULL, filesize);
+	if (rc != filesize) {
+		err_sys_die(EXIT_FAILNET, "Failure in sendfile routine");
 	}
 
-	if (offset != filesize) {
-		return FAILURE;
-	}
-
-	pr_debug("transmitted %d bytes with %d calls via sendfile()",
-			 filesize, tx_calls);
+	pr_debug("transmitted %d bytes via sendfile()", filesize);
 
 	return SUCCESS;
 }
@@ -1860,10 +1879,9 @@ static int cli_tx_request_pdu(const struct ctx *ctx, int afd, uint16_t port)
 
 	cli_construct_request_pdu(ctx, &request_pdu_hdr, port);
 
-	/* send a message to ctx->cl_srv_addr_info.ss */
-	ret = write(afd, &request_pdu_hdr, sizeof(request_pdu_hdr));
-	if (ret == -1 && !(errno == EWOULDBLOCK)) {
-		err_sys_die(EXIT_FAILNET, "Cannot send offer message");
+	ret = write_len(afd, &request_pdu_hdr, sizeof(request_pdu_hdr));
+	if (ret != SUCCESS) {
+		err_sys_die(EXIT_FAILNET, "Cannot send REQUEST PDU");
 	}
 
 	return SUCCESS;
@@ -1977,14 +1995,13 @@ static int cli_read_and_save_file(struct ctx *ctx, int fd)
 		display_throughput(progress, rx_bytes);
 
 		if (ret != rc) {
-			err_sys("write failed");
+			err_sys("write to file failed");
 			break;
 		}
 	}
 
 	if (rc < 0) {
-		// FIXME
-		abort();
+		err_msg_die(EXIT_FAILNET, "failure in read() call to peer socket");
 	}
 
 	stop_progress(&progress);
