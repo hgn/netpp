@@ -166,7 +166,8 @@ static const int debug_enabled = 0;
 #define EXIT_FAILHEADER 6
 #define EXIT_FAILEVENT  7
 #define EXIT_FAILFILE   8
-#define EXIT_FAILINT    9 /* INTernal error */
+#define EXIT_FAILSSL    9
+#define EXIT_FAILINT    10 /* INTernal error */
 
 #define SUCCESS 0
 #define FAILURE -1
@@ -1619,12 +1620,16 @@ static int srv_calc_sha1_for_file(struct ctx *ctx)
 
 	md = EVP_sha1();
 	if(!md) {
-		err_msg_die(EXIT_FAILMISC, "Cannot initialize SHA1 structures from openssl");
+		err_msg_die(EXIT_FAILSSL, "Cannot initialize SHA1 structures from openssl");
 		// FIXME: return failure and disable sha1 feature
+		return FAILURE;
 	}
 
 	EVP_MD_CTX_init(&mdctx);
-	EVP_DigestInit_ex(&mdctx, md, NULL);
+	ret = EVP_DigestInit_ex(&mdctx, md, NULL);
+	if (!ret) {
+		err_msg_die(EXIT_FAILSSL, "Cannot initialize ssl context");
+	}
 
 	fd = ctx->srv_file_hndl.fd;
 
@@ -1632,12 +1637,15 @@ static int srv_calc_sha1_for_file(struct ctx *ctx)
 
 	while ((rc = read(fd, buf, buflen)) > 0) {
 
-		// FIXME: catch failure for ssl stuff
-		EVP_DigestUpdate(&mdctx, buf, rc);
+		ret = EVP_DigestUpdate(&mdctx, buf, rc);
+		if (!ret) {
+			err_msg("failure in SHA1 calculation routine, skipping it");
+			return FAILURE;
+		}
 	}
 
 	if (rc < 0) {
-		// FIXME
+		// FIXME EINTR
 		abort();
 	}
 
