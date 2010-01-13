@@ -16,8 +16,6 @@
 ** Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-#define _FILE_OFFSET_BITS 64
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -304,6 +302,33 @@ struct ctx {
 	struct srv_file_hndl srv_file_hndl;
 };
 
+/* progress "bar" stuff */
+#define TP_IDX_MAX      8
+struct throughput {
+	off_t curr_total;
+	off_t prev_total;
+	struct timeval prev_tv;
+	unsigned int avg_bytes;
+	unsigned int avg_misecs;
+	unsigned int last_bytes[TP_IDX_MAX];
+	unsigned int last_misecs[TP_IDX_MAX];
+	unsigned int idx;
+	char display[32];
+};
+
+struct progress {
+	const char *title;
+	int last_value;
+	unsigned total;
+	unsigned last_percent;
+	unsigned delay;
+	unsigned delayed_percent_treshold;
+	struct throughput *throughput;
+};
+
+static struct progress *progress;
+static volatile int progress_update;
+
 
 static int subtime(struct timeval *op1, struct timeval *op2,
 				   struct timeval *result)
@@ -473,36 +498,6 @@ static int xatoi(const char *str)
 	return val;
 }
 
-
-/*******/
-
-#define TP_IDX_MAX      8
-
-struct throughput {
-	off_t curr_total;
-	off_t prev_total;
-	struct timeval prev_tv;
-	unsigned int avg_bytes;
-	unsigned int avg_misecs;
-	unsigned int last_bytes[TP_IDX_MAX];
-	unsigned int last_misecs[TP_IDX_MAX];
-	unsigned int idx;
-	char display[32];
-};
-
-struct progress {
-	const char *title;
-	int last_value;
-	unsigned total;
-	unsigned last_percent;
-	unsigned delay;
-	unsigned delayed_percent_treshold;
-	struct throughput *throughput;
-};
-
-
-static struct progress *progress;
-static volatile int progress_update;
 
 
 static void progress_interval(int signum __attribute__((unused)))
@@ -745,8 +740,6 @@ void stop_progress(struct progress **p_progress)
 	stop_progress_msg(p_progress, "done");
 }
 
-
-/*******/
 
 static int initiate_seed(void)
 {

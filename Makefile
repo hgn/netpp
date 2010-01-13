@@ -17,6 +17,8 @@ CFLAGS := -Wall -Wextra -pipe -Wwrite-strings -Wsign-compare \
 
 CFLAGS += -ggdb3 # -Werror
 
+CFLAGS += -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE
+
 ifdef EPOLL
 	EXTRA_CFLAGS := -DHAVE_EPOLL
 endif
